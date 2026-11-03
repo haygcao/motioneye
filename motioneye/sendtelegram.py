@@ -1,4 +1,3 @@
-
 # Copyright (c) 2013 Calin Crisan
 # This file is part of motionEye.
 #
@@ -6,178 +5,324 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
 
-import datetime
+import json
 import logging
-import io
 import os
-import sys
 import re
 import signal
 import socket
 import time
-import urllib
-import urllib2
-import pycurl
-import random
-import codecs
-import uuid
-import binascii
-import datetime
-import json
+from collections.abc import Callable
+from datetime import datetime
+from http.client import HTTPException, HTTPSConnection
+from secrets import token_hex
+from urllib.parse import urlencode
 
 from tornado.ioloop import IOLoop
 
-import settings
+from motioneye import config, mediafiles, meyectl, motionctl, settings, utils
 
-import config
-import mediafiles
-import motionctl
-import tzctl
-
-messages = {
-    'motion_start': 'Motion has been detected by camera "%(camera)s/%(hostname)s" at %(moment)s (%(timezone)s).'
-}
-
-user_agent = 'motionEye'
+_HOST = 'api.telegram.org'
+_CONNECT_TIMEOUT = 10
+# Telegram sometimes never answers a request it got: give up after this long
+# without data, rather than limiting the whole upload
+_STALL_TIMEOUT = 60
+# a socket timeout counts for the whole of a sendall(), so the body is sent in
+# pieces, each of which only has to go out within the stall timeout
+_UPLOAD_PIECE = 64 * 1024
 
 
-def send_message(api_key, chat_id, message, files):
-    telegram_message_url = 'https://api.telegram.org/bot%s/sendMessage' % api_key
-    telegram_photo_url = 'https://api.telegram.org/bot%s/sendPhoto' % api_key
-    c = pycurl.Curl()
-    c.setopt(c.POST, 1)
-    c.setopt(c.URL, telegram_message_url)
+class TelegramError(RuntimeError):
+    def __init__(self, code, description, retry_after):
+        super().__init__(f'telegram replied {code}: {description}')
+        self.retry_after = retry_after
+
+
+class _NotConnected(OSError):
+    """Nothing of the request was sent, so it can be sent again."""
+
+
+def _post_once(path: str, body: bytes, content_type: str) -> None:
+    # a new connection per request: none is reused after a stalled one
+    conn = HTTPSConnection(_HOST, timeout=_CONNECT_TIMEOUT)
+    try:
+        try:
+            conn.connect()
+
+        except OSError as e:
+            raise _NotConnected(f'could not connect to {_HOST}: {e}') from e
+
+        conn.sock.settimeout(_STALL_TIMEOUT)
+        pieces = (
+            body[i : i + _UPLOAD_PIECE] for i in range(0, len(body), _UPLOAD_PIECE)
+        )
+        headers = {'Content-Type': content_type, 'Content-Length': str(len(body))}
+        conn.request('POST', path, pieces, headers)
+        response = conn.getresponse()
+        code = response.status
+        reply = response.read()
+
+    finally:
+        conn.close()
+
+    try:
+        result = json.loads(reply)
+
+    except ValueError:
+        result = {}
+
+    if code != 200 or result.get('ok') is not True:
+        raise TelegramError(
+            code,
+            result.get('description') or 'no description',
+            (result.get('parameters') or {}).get('retry_after')
+            if code == 429
+            else None,
+        )
+
+
+def _post(path: str, body: bytes, content_type: str, retry: bool) -> None:
+    try:
+        _post_once(path, body, content_type)
+        return
+
+    except _NotConnected as e:
+        # once something was sent, Telegram may have it even if the reply is lost
+        # or late, so only a request that never went out is sent again
+        if not retry:
+            raise
+
+        delay = 5
+        logging.warning(f'telegram request failed, retrying in {delay}s: {e}')
+
+    except TelegramError as e:
+        if not retry or not isinstance(e.retry_after, int):
+            raise
+
+        if not 0 <= e.retry_after <= 30:
+            raise
+
+        delay = e.retry_after
+        logging.warning(f'{e}, retrying in {delay}s')
+
+    time.sleep(delay)
+    _post_once(path, body, content_type)
+
+
+def _photo_form(chat_id, caption: str, filename: str) -> tuple[bytes, str]:
+    boundary = token_hex(16)
+    name = os.path.basename(filename).replace('"', '')
+    with open(filename, 'rb') as f:
+        photo = f.read()
+
+    lines = [
+        f'--{boundary}',
+        'Content-Disposition: form-data; name="chat_id"',
+        '',
+        str(chat_id),
+        f'--{boundary}',
+        'Content-Disposition: form-data; name="caption"',
+        '',
+        caption,
+        f'--{boundary}',
+        f'Content-Disposition: form-data; name="photo"; filename="{name}"',
+        'Content-Type: application/octet-stream',
+        '',
+    ]
+    head = '\r\n'.join(lines).encode() + b'\r\n'
+    body = head + photo + f'\r\n--{boundary}--\r\n'.encode()
+
+    return body, f'multipart/form-data; boundary={boundary}'
+
+
+def send_message(api_key, chat_id, message, files, retry=True):
     if not files:
         logging.info('no files')
-        c.setopt(c.POSTFIELDS, "chat_id=%s&text=%s" % (chat_id, message))
-        c.perform()
+        body = urlencode({'chat_id': chat_id, 'text': message}).encode()
+        _post(
+            f'/bot{api_key}/sendMessage',
+            body,
+            'application/x-www-form-urlencoded',
+            retry,
+        )
+
     else:
         logging.info('files present')
+        failed = 0
         for f in files:
-            c.setopt(c.URL, telegram_photo_url)
-            c.setopt(c.HTTPPOST, [("chat_id", chat_id), ("caption", message), ("photo", (c.FORM_FILE, f))]) # Send photos
-            c.perform()
-    c.close()
-    logging.debug('sending email message')
+            try:
+                body, content_type = _photo_form(chat_id, message, f)
+                _post(f'/bot{api_key}/sendPhoto', body, content_type, retry)
 
-def make_message(message, camera_id, moment, timespan, callback):
+            except (RuntimeError, OSError, HTTPException) as e:
+                logging.error(f'failed to send "{os.path.basename(f)}": {e}')
+                failed += 1
+
+        if failed > 0:
+            raise RuntimeError(f'{failed} of {len(files)} pictures not sent')
+
+    logging.debug('sending telegram')
+
+
+def make_message(
+    message: str,
+    camera_id: int,
+    moment: datetime,
+    timespan: int,
+    callback: Callable,
+) -> None:
     camera_config = config.get_camera(camera_id)
-    
+
     # we must start the IO loop for the media list subprocess polling
-    io_loop = IOLoop.instance()
+    io_loop = IOLoop.current()
 
     def on_media_files(media_files):
         io_loop.stop()
-        photos = []
 
         timestamp = time.mktime(moment.timetuple())
-        if media_files:
+        files: list | None = (
+            media_files.result() if hasattr(media_files, 'result') else media_files
+        )
+        if files is None:
+            logging.warning(
+                f'picture listing timed out after {settings.LIST_MEDIA_TIMEOUT}s; sending '
+                'notification without pictures; consider raising list_media_timeout_telegram'
+            )
+            files = []
+
+        if files:
             logging.debug('got media files')
-            media_files = [m for m in media_files if abs(m['timestamp'] - timestamp) < float(timespan)]
-            media_files.sort(key=lambda m: m['timestamp'], reverse=True)
-            media_files = [os.path.join(camera_config['target_dir'], re.sub('^/', '', m['path'])) for m in media_files]
-            logging.debug('selected %d pictures' % len(media_files))
+            files = [m for m in files if abs(m['timestamp'] - timestamp) < timespan]
+            files.sort(key=lambda m: m['timestamp'])
+            files = [
+                os.path.join(camera_config['target_dir'], re.sub('^/', '', m['path']))
+                for m in files
+            ]
+            logging.debug(f'selected {len(files)} pictures')
 
         format_dict = {
             'camera': camera_config['camera_name'],
             'hostname': socket.gethostname(),
             'moment': moment.strftime('%Y-%m-%d %H:%M:%S'),
         }
-        
-        if settings.LOCAL_TIME_FILE:
-            format_dict['timezone'] = tzctl.get_time_zone()
 
-        else:
-            format_dict['timezone'] = 'local time'
+        format_dict['timezone'] = datetime.now().astimezone().tzname() or 'local time'
 
-        logging.debug('creating email message')
-    
+        logging.debug('creating telegram message')
+
         m = message % format_dict
 
-        callback(m, media_files)
+        callback(m, files)
 
     if not timespan:
-        return on_media_files([])
-    
-    logging.debug('waiting for pictures to be taken')
-    time.sleep(float(timespan))  # give motion some time to create motion pictures
+        on_media_files([])
+
+        return
+
+    logging.debug(f'waiting {timespan}s for pictures to be taken')
+    time.sleep(timespan)  # give motion some time to create motion pictures
 
     prefix = None
-    picture_filename = camera_config.get('picture_filename')
-    snapshot_filename = camera_config.get('snapshot_filename')
+    picture_filename: str = camera_config.get('picture_filename', '')
+    snapshot_filename: str = camera_config.get('snapshot_filename', '')
 
-    if ((picture_filename or snapshot_filename) and
-        not picture_filename or picture_filename.startswith('%Y-%m-%d/') and
-        not snapshot_filename or snapshot_filename .startswith('%Y-%m-%d/')):
-        moment = datetime.datetime.strptime(moment, '%Y-%m-%dT%H:%M:%S')
+    if (
+        (picture_filename or snapshot_filename)
+        and not picture_filename
+        or picture_filename.startswith('%Y-%m-%d/')
+        and not snapshot_filename
+        or snapshot_filename.startswith('%Y-%m-%d/')
+    ):
         prefix = moment.strftime('%Y-%m-%d')
-        logging.debug('narrowing down still images path lookup to %s' % prefix)
+        logging.debug(f'narrowing down still images path lookup to {prefix}')
 
-    mediafiles.list_media(camera_config, media_type='picture', prefix=prefix, callback=on_media_files)
-    
+    # only pictures within +/- timespan are used, see on_media_files()
+    event_timestamp: float = time.mktime(moment.timetuple())
+    fut = utils.cast_future(
+        mediafiles.list_media(
+            camera_config,
+            media_type='picture',
+            prefix=prefix,
+            min_timestamp=event_timestamp - timespan,
+            max_timestamp=event_timestamp + timespan,
+        )
+    )
+    fut.add_done_callback(on_media_files)
     io_loop.start()
+
+    return
 
 
 def parse_options(parser, args):
-    parser.add_argument('api', help='telegram api key')
-    parser.add_argument('chatid', help='telegram chat room id')
-    parser.add_argument('msg_id', help='the identifier of the message')
+    # the settings are in the camera config
+    parser.description = 'Send Telegram using bot api'
     parser.add_argument('motion_camera_id', help='the id of the motion camera')
     parser.add_argument('moment', help='the moment in ISO-8601 format')
-    parser.add_argument('timespan', help='picture collection time span')
-    return parser.parse_args(args)
-    
+    options, extra = parser.parse_known_args(args)
+    if extra:  # without their values, they may be secrets
+        parser.error(
+            f'{len(extra)} unexpected arguments, '
+            'motionEye converts its own older commands when it starts'
+        )
+
+    try:  # not a type=, older commands have the chat id here
+        options.moment = datetime.fromisoformat(options.moment)
+
+    except ValueError:
+        parser.error('moment must be in ISO-8601 format')
+
+    return options
+
 
 def main(parser, args):
-    import meyectl
-    
     # the motion daemon overrides SIGCHLD,
     # so we must restore it here,
     # or otherwise media listing won't work
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
-    if len(args) == 12:
-        # backwards compatibility with older configs lacking "from" field
-        _from = 'motionEye on %s <%s>' % (socket.gethostname(), args[7].split(',')[0])
-        args = args[:7] + [_from] + args[7:]
-    
-    if not args[7]:
-        args[7] = 'motionEye on %s <%s>' % (socket.gethostname(), args[8].split(',')[0])
-
     options = parse_options(parser, args)
-    print options 
-    meyectl.configure_logging('telegram', options.log_to_file)
+    meyectl.configure_logging('telegram')
+    logging.debug(options)
+    message = 'Motion has been detected by camera "%(camera)s/%(hostname)s" at %(moment)s (%(timezone)s).'
 
-    logging.debug('hello!')
-    message = messages.get(options.msg_id)
+    camera_id = motionctl.motion_camera_id_to_camera_id(options.motion_camera_id)
+    stored = config.get_notification_settings(camera_id, config.SENDTELEGRAM_KEYS)
+    if not stored:
+        logging.error(
+            f'motion camera {options.motion_camera_id} has no Telegram settings'
+        )
+        return
+
+    vars(options).update(stored)
 
     # do not wait too long for media list,
     # telegram notifications are critical
-    settings.LIST_MEDIA_TIMEOUT = settings.LIST_MEDIA_TIMEOUT_TELEGRAM
-    
-    camera_id = motionctl.motion_camera_id_to_camera_id(options.motion_camera_id)
+    try:
+        options.timespan = int(options.timespan)
+    except (TypeError, ValueError):
+        options.timespan = 0
 
-    logging.debug('timespan = %d' % int(options.timespan))
-    
+    settings.LIST_MEDIA_TIMEOUT = settings.LIST_MEDIA_TIMEOUT_TELEGRAM
+
     def on_message(message, files):
         try:
-            print message
-            logging.info('sending telegram')
+            logging.info(f'sending telegram : {message}')
             send_message(options.api, options.chatid, message, files or [])
             logging.info('telegram sent')
 
-        except Exception as e:
-            logging.error('failed to send telegram: %s' % e, exc_info=True)
+        except Exception:
+            logging.exception('failed to send telegram')
 
         logging.debug('bye!')
-    
+
     make_message(message, camera_id, options.moment, options.timespan, on_message)

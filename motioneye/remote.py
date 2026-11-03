@@ -1,4 +1,3 @@
-
 # Copyright (c) 2013 Calin Crisan
 # This file is part of motionEye.
 #
@@ -6,79 +5,107 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
 
-import functools
 import json
 import logging
 import re
+from math import isfinite
+from time import time
+from urllib.parse import urlencode
 
-from tornado.httpclient import AsyncHTTPClient, HTTPRequest
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest, HTTPResponse
 
-import settings
-import utils
+from motioneye import settings, utils
+from motioneye.utils.authstate import generate_hmac_signature, generate_nonce
 
 _DOUBLE_SLASH_REGEX = re.compile('//+')
 
 
-def _make_request(scheme, host, port, username, password, path, method='GET', data=None, query=None,
-                  timeout=None, content_type=None):
-
+def _make_request(
+    scheme,
+    host,
+    port,
+    remote_secret,
+    path,
+    method='GET',
+    data=None,
+    query=None,
+    timeout=None,
+    content_type=None,
+    validate_cert=True,
+):
     path = _DOUBLE_SLASH_REGEX.sub('/', path)
-    url = '%(scheme)s://%(host)s%(port)s%(path)s' % {
-            'scheme': scheme,
-            'host': host,
-            'port': ':' + str(port) if port else '',
-            'path': path or ''}
-    
     query = dict(query or {})
-    query['_username'] = username or ''
-    query['_admin'] = 'true'  # always use the admin account
-    
-    if url.count('?'):
-        url += '&'
-        
-    else:
-        url += '?'
-    
-    url += '&'.join([(n + '=' + v) for (n, v) in query.iteritems()])
-    url += '&_signature=' + utils.compute_signature(method, url, data, password)
+    qs = urlencode(query)
+    uri = (path + ('&' if '?' in path else '?') + qs) if qs else path
 
-    if timeout is None:
-        timeout = settings.REMOTE_REQUEST_TIMEOUT
-    
+    url = '{scheme}://{host}{port}{uri}'.format(
+        scheme=scheme, host=host, port=':' + str(port) if port else '', uri=uri or ''
+    )
+
+    # Use HMAC authentication instead of query parameters
     headers = {}
     if content_type:
         headers['Content-Type'] = content_type
 
-    return HTTPRequest(url, method, body=data, connect_timeout=timeout, request_timeout=timeout, headers=headers,
-                       validate_cert=settings.VALIDATE_CERTS)
+    if remote_secret:
+        timestamp = str(int(time()))
+        nonce = generate_nonce()
+        signature = generate_hmac_signature(
+            remote_secret, method, uri, timestamp, nonce, data
+        )
+
+        headers['X-HMAC-Signature'] = signature
+        headers['X-Timestamp'] = timestamp
+        headers['X-Nonce'] = nonce
+    if timeout is None:
+        timeout = settings.REMOTE_REQUEST_TIMEOUT
+
+    return HTTPRequest(
+        url,
+        method,
+        body=data,
+        connect_timeout=timeout,
+        request_timeout=timeout,
+        headers=headers,
+        validate_cert=validate_cert,
+        follow_redirects=False,
+    )
 
 
-def _callback_wrapper(callback):
-    @functools.wraps(callback)
-    def wrapper(response):
-        try:
+async def _send_request(request: HTTPRequest) -> HTTPResponse:
+    try:
+        # The raise_error=False argument only affects the HTTPError raised when a non-200 response
+        # code is used, instead of suppressing all errors.
+        response = await AsyncHTTPClient().fetch(request, raise_error=False)
+
+        if response.code != 200:
             decoded = json.loads(response.body)
             if decoded['error'] == 'unauthorized':
-                response.error = 'Authentication Error'
-                
-            elif decoded['error']:
-                response.error = decoded['error']
+                response.error = Exception('Authentication Error')
 
-        except:
-            pass
-        
-        return callback(response)
-    
-    return wrapper
+            elif decoded['error']:
+                response.error = Exception(decoded['error'])
+
+        elif response.headers.get('Content-Type', '').startswith('application/json'):
+            decoded = json.loads(response.body)
+            if isinstance(decoded, dict) and decoded.get('error'):
+                response.error = utils.RemoteError(decoded['error'])
+    except Exception as e:
+        logging.error(f"_send_request: {e}")
+        response = HTTPResponse(request, 599)
+        response.error = e
+
+    return response
 
 
 def pretty_camera_url(local_config, camera=True):
@@ -90,635 +117,839 @@ def pretty_camera_url(local_config, camera=True):
     url = scheme + '://' + host
     if port and str(port) not in ['80', '443']:
         url += ':' + str(port)
-    
+
     if path:
         url += path
-        
-    if url.endswith('/'):
-        url = url[:-1]
+
+    url = url.removesuffix('/')
 
     if camera:
         if camera is True:
-            url += '/config/' + str(local_config.get('@remote_camera_id', local_config.get('remote_camera_id')))
-        
+            url += '/config/' + str(
+                local_config.get(
+                    '@remote_camera_id', local_config.get('remote_camera_id')
+                )
+            )
+
         else:
             url += '/config/' + str(camera)
 
     return url
 
 
+def _verify_flag(local_config) -> bool:
+    value = local_config.get('@remote_verify', local_config.get('remote_verify'))
+
+    return utils.verify_setting(value)
+
+
 def _remote_params(local_config):
     params = [
-            local_config.get('@scheme', local_config.get('scheme')) or 'http',
-            local_config.get('@host', local_config.get('host')),
-            local_config.get('@port', local_config.get('port')),
-            local_config.get('@username', local_config.get('username')),
-            local_config.get('@password', local_config.get('password')),
-            local_config.get('@path', local_config.get('path')) or '',
-            local_config.get('@remote_camera_id', local_config.get('remote_camera_id'))]
-    
+        local_config.get('@scheme', local_config.get('scheme')) or 'http',
+        local_config.get('@host', local_config.get('host')),
+        local_config.get('@port', local_config.get('port')),
+        local_config.get('@remote_secret', local_config.get('remote_secret')),
+        local_config.get('@path', local_config.get('path')) or '',
+        local_config.get('@remote_camera_id', local_config.get('remote_camera_id')),
+        _verify_flag(local_config),
+    ]
+
     if params[3] is not None:
         params[3] = str(params[3])
-    
+
     if params[4] is not None:
         params[4] = str(params[4])
+
+    if params[5] is not None:
+        params[5] = str(params[5])
 
     return params
 
 
-def list(local_config, callback):
-    scheme, host, port, username, password, path, _ = _remote_params(local_config)
-    
-    logging.debug('listing remote cameras on %(url)s' % {
-            'url': pretty_camera_url(local_config, camera=False)})
-    
-    request = _make_request(scheme, host, port, username, password,
-                            path + '/config/list/')
-    
-    def on_response(response):
-        def make_camera_response(c):
-            return {
-                'id': c['id'],
-                'name': c['name']
-            }
-        
-        if response.error:
-            logging.error('failed to list remote cameras on %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config, camera=False),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-        
-        try:
-            response = json.loads(response.body)
-            
-        except Exception as e:
-            logging.error('failed to decode json answer from %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config, camera=False),
-                    'msg': unicode(e)})
-            
-            return callback(error=unicode(e))
-        
-        cameras = response['cameras']
-        
-        # filter out simple mjpeg cameras
-        cameras = [make_camera_response(c) for c in cameras if c['proto'] != 'mjpeg' and c.get('enabled')]
-        
-        callback(cameras)
-    
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
-    
+def make_camera_response(c):
+    return {'id': c.get('id'), 'name': c.get('name')}
 
-def get_config(local_config, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-     
-    logging.debug('getting config for remote camera %(id)s on %(url)s' % {
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
-    request = _make_request(scheme, host, port, username, password,
-                            path + '/config/%(id)s/get/' % {'id': camera_id})
-    
-    def on_response(response):
-        if response.error:
-            logging.error('failed to get config for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-    
-        try:
-            response = json.loads(response.body)
-        
-        except Exception as e:
-            logging.error('failed to decode json answer from %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config),
-                    'msg': unicode(e)})
-            
-            return callback(error=unicode(e))
-        
+
+async def list_cameras(local_config) -> utils.GetCamerasResponse:
+    scheme, host, port, remote_secret, path, _camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'listing remote cameras on {pretty_camera_url(local_config, camera=False)}'
+    )
+
+    request = _make_request(
+        scheme, host, port, remote_secret, path + '/config/list/', validate_cert=verify
+    )
+
+    response = await _send_request(request)
+
+    if response.error:
+        logging.error(
+            'failed to list remote cameras on '
+            f'{pretty_camera_url(local_config, camera=False)}: {utils.pretty_http_error(response)}'
+        )
+
+        return utils.GetCamerasResponse(None, utils.pretty_http_error(response))
+
+    try:
+        response = json.loads(response.body)
+
+    except Exception as e:
+        logging.error(
+            f'failed to decode json answer from {pretty_camera_url(local_config, camera=False)}: {e}'
+        )
+
+        return utils.GetCamerasResponse(None, str(e))
+
+    else:
+        cameras = response.get('cameras') if isinstance(response, dict) else None
+        if not isinstance(cameras, list) or not all(
+            isinstance(c, dict) for c in cameras
+        ):
+            logging.error(
+                f'unexpected answer from {pretty_camera_url(local_config, camera=False)}'
+            )
+
+            return utils.GetCamerasResponse(None, 'unexpected answer')
+
+        # filter out simple mjpeg cameras
+        cameras = [
+            make_camera_response(c)
+            for c in cameras
+            if c.get('proto') != 'mjpeg' and c.get('enabled')
+        ]
+
+        return utils.GetCamerasResponse(cameras, None)
+
+
+async def get_config(local_config) -> utils.GetConfigResponse:
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'getting config for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path + f'/config/{camera_id}/get/',
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+
+    if response.error:
+        logging.error(
+            'failed to get config for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+
+        return utils.GetConfigResponse(None, error=utils.pretty_http_error(response))
+
+    try:
+        response = json.loads(response.body)
+
+    except Exception as e:
+        logging.error(
+            f'failed to decode json answer from {pretty_camera_url(local_config)}: {e}'
+        )
+
+        return utils.GetConfigResponse(None, error=str(e))
+
+    else:
+        if not isinstance(response, dict):
+            logging.error(f'unexpected answer from {pretty_camera_url(local_config)}')
+
+            return utils.GetConfigResponse(None, error='unexpected answer')
+
         response['host'] = host
         response['port'] = port
-            
-        callback(response)
-    
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
-    
 
-def set_config(local_config, ui_config, callback):
-    scheme = local_config.get('@scheme', local_config.get('scheme'))
-    host = local_config.get('@host', local_config.get('host')) 
-    port = local_config.get('@port', local_config.get('port'))
-    username = local_config.get('@username', local_config.get('username'))
-    password = local_config.get('@password', local_config.get('password'))
-    path = local_config.get('@path', local_config.get('path')) or ''
-    camera_id = local_config.get('@remote_camera_id', local_config.get('remote_camera_id'))
+        # Only forward an empty string, which indicates that no password is set.
+        # New backends send nothing if a password is set, but old backends send
+        # "*****" instead, which is unset here to align with new behavior.
+        if (
+            response.get('streaming_password') is not None
+            and response['streaming_password'] != ''
+        ):
+            del response['streaming_password']
 
-    logging.debug('setting config for remote camera %(id)s on %(url)s' % {
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
+        return utils.GetConfigResponse(remote_ui_config=response, error=None)
+
+
+async def set_config(local_config, ui_config) -> str | None:
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'setting config for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
     ui_config = json.dumps(ui_config)
 
-    p = path + '/config/%(id)s/set/' % {'id': camera_id}
-    request = _make_request(scheme, host, port, username, password, p,
-                            method='POST', data=ui_config, content_type='application/json')
-    
-    def on_response(response):
-        if response.error:
-            logging.error('failed to set config for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-    
-        callback()
+    p = path + f'/config/{camera_id}/set/'
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        p,
+        method='POST',
+        data=ui_config.encode(),
+        content_type='application/json',
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
 
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    result = None
+
+    if response.error:
+        logging.error(
+            'failed to set config for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+
+        result = utils.pretty_http_error(response)
+
+    return result
 
 
-def test(local_config, data, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
+async def test(local_config, data) -> utils.CommonExternalResponse:
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
     what = data['what']
-    logging.debug('testing %(what)s on remote camera %(id)s, on %(url)s' % {
-            'what': what,
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
+    logging.debug(
+        f'testing {what} on remote camera {camera_id}, on {pretty_camera_url(local_config)}'
+    )
 
     data = json.dumps(data)
 
-    p = path + '/config/%(id)s/test/' % {'id': camera_id}
-    request = _make_request(scheme, host, port, username, password, p,
-                            method='POST', data=data, content_type='application/json')
+    p = path + f'/config/{camera_id}/test/'
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        p,
+        method='POST',
+        data=data,
+        content_type='application/json',
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            f'failed to test {what} on remote camera {camera_id}, '
+            f'on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to test %(what)s on remote camera %(id)s, on %(url)s: %(msg)s' % {
-                    'what': what,
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
+        return utils.CommonExternalResponse(
+            None, error=utils.pretty_http_error(response)
+        )
 
-            return callback(error=utils.pretty_http_error(response))
-        
-        callback()
-
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    return utils.CommonExternalResponse(
+        None, None
+    )  # it will never return result = True, what the point?
 
 
-def get_current_picture(local_config, width, height, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-#     logging.debug('getting current picture for remote camera %(id)s on %(url)s' % {
-#             'id': camera_id,
-#             'url': pretty_camera_url(local_config)})
-    
+async def get_authorize_url(local_config, service: str) -> str | None:
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path + f'/config/{camera_id}/authorize/',
+        query={'service': service},
+        validate_cert=verify,
+    )
+    try:
+        response = await AsyncHTTPClient().fetch(request, raise_error=False)
+
+    except Exception as e:
+        logging.error(f'failed to get the authorization url of {service}: {e}')
+        return None
+
+    # the remote answers with a redirect to the authorization url
+    url = response.headers.get('Location') if response.code in (301, 302) else None
+    if not url:
+        logging.error(
+            f'failed to get the authorization url of {service} from remote camera '
+            f'{camera_id}, on {pretty_camera_url(local_config)}: {response.code}'
+        )
+
+    return url
+
+
+async def get_current_picture(
+    local_config, width, height
+) -> utils.GetCurrentPictureResponse:
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'getting current picture for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
     query = {}
-    
+
     if width:
         query['width'] = str(width)
-        
+
     if height:
         query['height'] = str(height)
 
-    p = path + '/picture/%(id)s/current/' % {'id': camera_id}
-    request = _make_request(scheme, host, port, username, password, p, query=query)
-    
-    def on_response(response):
-        cookies = utils.parse_cookies(response.headers.get_list('Set-Cookie'))
-        motion_detected = cookies.get('motion_detected_' + str(camera_id)) == 'true'
-        capture_fps = cookies.get('capture_fps_' + str(camera_id))
-        capture_fps = float(capture_fps) if capture_fps else 0
-        monitor_info = cookies.get('monitor_info_' + str(camera_id))
+    p = path + f'/picture/{camera_id}/current/'
 
-        if response.error:
-            logging.error('failed to get current picture for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
+    request = _make_request(
+        scheme, host, port, remote_secret, p, query=query, validate_cert=verify
+    )
+    response = await _send_request(request)
 
-        callback(motion_detected, capture_fps, monitor_info, response.body)
-    
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    if response.error:
+        logging.error(
+            'failed to get current picture for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+        return utils.GetCurrentPictureResponse(error=utils.pretty_http_error(response))
+
+    cookies = utils.parse_cookies(response.headers.get_list('Set-Cookie'))
+    motion_detected = cookies.get('motion_detected_' + str(camera_id)) == 'true'
+    motion_detection: bool | None = None
+    motion_detection_cookie: str | None = cookies.get(
+        'motion_detection_' + str(camera_id)
+    )
+    if motion_detection_cookie is not None:
+        motion_detection = motion_detection_cookie == 'true'
+    try:
+        capture_fps = float(cookies.get('capture_fps_' + str(camera_id)) or 0.0)
+
+    except ValueError:
+        capture_fps = 0.0
+
+    if not isfinite(capture_fps) or capture_fps < 0:
+        capture_fps = 0.0
+
+    monitor_info = cookies.get('monitor_info_' + str(camera_id))
+
+    return utils.GetCurrentPictureResponse(
+        motion_detected=motion_detected,
+        motion_detection=motion_detection,
+        capture_fps=capture_fps,
+        monitor_info=monitor_info,
+        picture=response.body,
+    )
 
 
-def list_media(local_config, media_type, prefix, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('getting media list for remote camera %(id)s on %(url)s' % {
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
+async def list_media(
+    local_config, media_type, prefix: str | None = None
+) -> utils.ListMediaResponse:
+    utils.validate_paths(prefix)
+
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'getting media list for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
     query = {}
     if prefix is not None:
         query['prefix'] = prefix
-    
+
     # timeout here is 10 times larger than usual - we expect a big delay when fetching the media list
-    p = path + '/%(media_type)s/%(id)s/list/' % {'id': camera_id, 'media_type': media_type}
-    request = _make_request(scheme, host, port, username, password, p, query=query,
-                            timeout=10 * settings.REMOTE_REQUEST_TIMEOUT)
-    
-    def on_response(response):
-        if response.error:
-            logging.error('failed to get media list for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-        
-        try:
-            response = json.loads(response.body)
-            
-        except Exception as e:
-            logging.error('failed to decode json answer from %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config),
-                    'msg': unicode(e)})
-            
-            return callback(error=unicode(e))
-        
-        return callback(response)
-    
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    p = path + f'/{media_type}/{camera_id}/list/'
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        p,
+        query=query,
+        timeout=10 * settings.REMOTE_REQUEST_TIMEOUT,
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            'failed to get media list for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+
+        return utils.ListMediaResponse(error=utils.pretty_http_error(response))
+
+    try:
+        response = json.loads(response.body)
+
+    except Exception as e:
+        logging.error(
+            f'failed to decode json answer from {pretty_camera_url(local_config)}: {e}'
+        )
+
+        return utils.ListMediaResponse(error=str(e))
+
+    return utils.ListMediaResponse(media_list=response)
 
 
-def get_media_content(local_config, filename, media_type, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('downloading file %(filename)s of remote camera %(id)s on %(url)s' % {
-            'filename': filename,
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
-    path += '/%(media_type)s/%(id)s/download/%(filename)s' % {
-            'media_type': media_type,
-            'id': camera_id,
-            'filename': filename}
-    
+async def get_media_content(
+    local_config: dict, filename: str, media_type: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(filename)
+
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'downloading file {filename} of remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
+    path += f'/{media_type}/{camera_id}/download/{filename}'
+
     # timeout here is 10 times larger than usual - we expect a big delay when fetching the media list
-    request = _make_request(scheme, host, port, username, password,
-                            path, timeout=10 * settings.REMOTE_REQUEST_TIMEOUT)
-    
-    def on_response(response):
-        if response.error:
-            logging.error('failed to download file %(filename)s of remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'filename': filename,
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-        
-        return callback(response.body)
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path,
+        timeout=10 * settings.REMOTE_REQUEST_TIMEOUT,
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            f'failed to download file {filename} of remote camera {camera_id} '
+            f'on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
 
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    return utils.CommonExternalResponse(result=response.body)
 
 
-def make_zipped_content(local_config, media_type, group, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('preparing zip file for group "%(group)s" of remote camera %(id)s on %(url)s' % {
-            'group': group or 'ungrouped',
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
+async def make_zipped_content(
+    local_config, media_type, group: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(group)
 
-    prepare_path = path + '/%(media_type)s/%(id)s/zipped/%(group)s/' % {
-            'media_type': media_type,
-            'id': camera_id,
-            'group': group}
- 
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        'preparing zip file for group "{group}" of remote camera {id} on {url}'.format(
+            group=group or 'ungrouped',
+            id=camera_id,
+            url=pretty_camera_url(local_config),
+        )
+    )
+
+    prepare_path = path + f'/{media_type}/{camera_id}/zipped/{group}/'
+
     # timeout here is 100 times larger than usual - we expect a big delay
-    request = _make_request(scheme, host, port, username, password,
-                            prepare_path, timeout=100 * settings.REMOTE_REQUEST_TIMEOUT)
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        prepare_path,
+        timeout=100 * settings.REMOTE_REQUEST_TIMEOUT,
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        msg = (
+            'failed to prepare zip file for group "{group}" '
+            'of remote camera {id} on {url}: {msg}'.format(
+                group=group or 'ungrouped',
+                id=camera_id,
+                url=pretty_camera_url(local_config),
+                msg=utils.pretty_http_error(response),
+            )
+        )
 
-    def on_response(response):
-        if response.error:
-            msg = 'failed to prepare zip file for group "%(group)s" ' \
-                  'of remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'group': group or 'ungrouped',
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)}
+        logging.error(msg)
 
-            logging.error(msg)
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
 
-            return callback(error=utils.pretty_http_error(response))
-        
-        try:
-            key = json.loads(response.body)['key']
+    try:
+        key = json.loads(response.body)['key']
 
-        except Exception as e:
-            logging.error('failed to decode json answer from %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config),
-                    'msg': unicode(e)})
+    except Exception as e:
+        logging.error(
+            f'failed to decode json answer from {pretty_camera_url(local_config)}: {e}'
+        )
 
-            return callback(error=unicode(e))
-
-        callback({'key': key})
-
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+        return utils.CommonExternalResponse(error=str(e))
+    else:
+        return utils.CommonExternalResponse(result={'key': key})
 
 
-def get_zipped_content(local_config, media_type, key, group, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('downloading zip file for remote camera %(id)s on %(url)s' % {
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
+async def get_zipped_content(
+    local_config, media_type, key, group: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(group)
 
-    p = path + '/%(media_type)s/%(id)s/zipped/%(group)s/?key=%(key)s' % {
-            'media_type': media_type,
-            'group': group,
-            'id': camera_id,
-            'key': key}
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
 
-    request = _make_request(scheme, host, port, username, password, p,
-                            timeout=10 * settings.REMOTE_REQUEST_TIMEOUT)
+    logging.debug(
+        f'downloading zip file for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to download zip file for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
+    p = path + f'/{media_type}/{camera_id}/zipped/{group}/?key={key}'
 
-            return callback(error=utils.pretty_http_error(response))
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        p,
+        timeout=10 * settings.REMOTE_REQUEST_TIMEOUT,
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            'failed to download zip file for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
 
-        callback({
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    return utils.CommonExternalResponse(
+        result={
             'data': response.body,
             'content_type': response.headers.get('Content-Type'),
-            'content_disposition': response.headers.get('Content-Disposition')
-        })
-
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+            'content_disposition': response.headers.get('Content-Disposition'),
+        }
+    )
 
 
-def make_timelapse_movie(local_config, framerate, interval, group, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
+async def make_timelapse_movie(
+    local_config, framerate, interval, group: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(group)
 
-    msg = 'making timelapse movie for group "%(group)s" of remote camera %(id)s ' \
-          'with rate %(framerate)s/%(int)s on %(url)s' % {
-            'group': group or 'ungrouped',
-            'id': camera_id,
-            'framerate': framerate,
-            'int': interval,
-            'url': pretty_camera_url(local_config)}
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    msg = (
+        'making timelapse movie for group "{group}" of remote camera {id} '
+        'with rate {framerate}/{int} on {url}'.format(
+            group=group or 'ungrouped',
+            id=camera_id,
+            framerate=framerate,
+            int=interval,
+            url=pretty_camera_url(local_config),
+        )
+    )
 
     logging.debug(msg)
 
-    path += '/picture/%(id)s/timelapse/%(group)s/?interval=%(int)s&framerate=%(framerate)s' % {
-            'id': camera_id,
-            'int': interval,
-            'framerate': framerate,
-            'group': group}
-    
-    request = _make_request(scheme, host, port, username, password,
-                            path, timeout=100 * settings.REMOTE_REQUEST_TIMEOUT)
+    path += f'/picture/{camera_id}/timelapse/{group}/?interval={interval}&framerate={framerate}'
 
-    def on_response(response):
-        if response.error:
-            msg = 'failed to make timelapse movie for group "%(group)s" of remote camera %(id)s ' \
-                  'with rate %(framerate)s/%(int)s on %(url)s: %(msg)s' % {
-                    'group': group or 'ungrouped',
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'int': interval,
-                    'framerate': framerate,
-                    'msg': utils.pretty_http_error(response)}
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path,
+        timeout=100 * settings.REMOTE_REQUEST_TIMEOUT,
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        msg = (
+            'failed to make timelapse movie for group "{group}" of remote camera {id} '
+            'with rate {framerate}/{int} on {url}: {msg}'.format(
+                group=group or 'ungrouped',
+                id=camera_id,
+                url=pretty_camera_url(local_config),
+                int=interval,
+                framerate=framerate,
+                msg=utils.pretty_http_error(response),
+            )
+        )
 
-            logging.error(msg)
+        logging.error(msg)
 
-            return callback(error=utils.pretty_http_error(response))
-        
-        try:
-            response = json.loads(response.body)
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
 
-        except Exception as e:
-            logging.error('failed to decode json answer from %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config),
-                    'msg': unicode(e)})
+    try:
+        response = json.loads(response.body)
 
-            return callback(error=unicode(e))
-        
-        callback(response)
+    except Exception as e:
+        logging.error(
+            f'failed to decode json answer from {pretty_camera_url(local_config)}: {e}'
+        )
 
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+        return utils.CommonExternalResponse(error=str(e))
 
+    else:
+        if not isinstance(response, dict):
+            return utils.CommonExternalResponse(error='unexpected answer')
 
-def check_timelapse_movie(local_config, group, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('checking timelapse movie status for remote camera %(id)s on %(url)s' % {
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-
-    p = path + '/picture/%(id)s/timelapse/%(group)s/?check=true' % {
-            'id': camera_id,
-            'group': group}
-    request = _make_request(scheme, host, port, username, password, p)
-    
-    def on_response(response):
-        if response.error:
-            logging.error('failed to check timelapse movie status for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-
-            return callback(error=utils.pretty_http_error(response))
-        
-        try:
-            response = json.loads(response.body)
-
-        except Exception as e:
-            logging.error('failed to decode json answer from %(url)s: %(msg)s' % {
-                    'url': pretty_camera_url(local_config),
-                    'msg': unicode(e)})
-
-            return callback(error=unicode(e))
-        
-        callback(response)
-
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+        return utils.CommonExternalResponse(result=response)
 
 
-def get_timelapse_movie(local_config, key, group, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('downloading timelapse movie for remote camera %(id)s on %(url)s' % {
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
+async def check_timelapse_movie(
+    local_config, group: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(group)
 
-    p = path + '/picture/%(id)s/timelapse/%(group)s/?key=%(key)s' % {
-            'id': camera_id,
-            'group': group,
-            'key': key}
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
 
-    request = _make_request(scheme, host, port, username, password, p,
-                            timeout=10 * settings.REMOTE_REQUEST_TIMEOUT)
+    logging.debug(
+        f'checking timelapse movie status for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to download timelapse movie for remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
+    p = path + f'/picture/{camera_id}/timelapse/{group}/?check=true'
+    request = _make_request(scheme, host, port, remote_secret, p, validate_cert=verify)
+    response = await _send_request(request)
 
-            return callback(error=utils.pretty_http_error(response))
+    if response.error:
+        logging.error(
+            'failed to check timelapse movie status for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
 
-        callback({
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    try:
+        response = json.loads(response.body)
+
+    except Exception as e:
+        logging.error(
+            f'failed to decode json answer from {pretty_camera_url(local_config)}: {e}'
+        )
+
+        return utils.CommonExternalResponse(error=str(e))
+
+    else:
+        if not isinstance(response, dict):
+            return utils.CommonExternalResponse(error='unexpected answer')
+
+        return utils.CommonExternalResponse(result=response)
+
+
+async def get_timelapse_movie(
+    local_config, key, group: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(group)
+
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'downloading timelapse movie for remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
+    p = path + f'/picture/{camera_id}/timelapse/{group}/?key={key}'
+
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        p,
+        timeout=10 * settings.REMOTE_REQUEST_TIMEOUT,
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            'failed to download timelapse movie for remote camera '
+            f'{camera_id} on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    return utils.CommonExternalResponse(
+        result={
             'data': response.body,
             'content_type': response.headers.get('Content-Type'),
-            'content_disposition': response.headers.get('Content-Disposition')
-        })
-
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+            'content_disposition': response.headers.get('Content-Disposition'),
+        }
+    )
 
 
-def get_media_preview(local_config, filename, media_type, width, height, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('getting file preview for %(filename)s of remote camera %(id)s on %(url)s' % {
-            'filename': filename,
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
-    path += '/%(media_type)s/%(id)s/preview/%(filename)s' % {
-            'media_type': media_type,
-            'id': camera_id,
-            'filename': filename}
-    
+async def get_media_preview(
+    local_config: dict,
+    filename: str,
+    media_type: str,
+    width: str | None = None,
+    height: str | None = None,
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(filename)
+
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'getting file preview for {filename} of remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
+    path += f'/{media_type}/{camera_id}/preview/{filename}'
+
     query = {}
-    
+
     if width:
         query['width'] = str(width)
-        
+
     if height:
         query['height'] = str(height)
-    
-    request = _make_request(scheme, host, port, username, password, path, query=query)
-    
-    def on_response(response):
-        if response.error:
-            logging.error('failed to get file preview for %(filename)s of remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'filename': filename,
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-        
-        callback(response.body)
 
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    request = _make_request(
+        scheme, host, port, remote_secret, path, query=query, validate_cert=verify
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            f'failed to get file preview for {filename} of remote camera {camera_id} '
+            f'on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    return utils.CommonExternalResponse(result=response.body)
 
 
-def del_media_content(local_config, filename, media_type, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('deleting file %(filename)s of remote camera %(id)s on %(url)s' % {
-            'filename': filename,
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
-    path += '/%(media_type)s/%(id)s/delete/%(filename)s' % {
-            'media_type': media_type,
-            'id': camera_id,
-            'filename': filename}
+async def del_media_content(
+    local_config: dict, filename: str, media_type: str
+) -> utils.CommonExternalResponse:
+    utils.validate_paths(filename)
 
-    request = _make_request(scheme, host, port, username, password, path, method='POST', data='{}',
-                            timeout=settings.REMOTE_REQUEST_TIMEOUT, content_type='application/json')
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to delete file %(filename)s of remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'filename': filename,
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-        
-        callback()
+    logging.debug(
+        f'deleting file {filename} of remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
 
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    path += f'/{media_type}/{camera_id}/delete/{filename}'
 
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path,
+        method='POST',
+        data='{}',
+        timeout=settings.REMOTE_REQUEST_TIMEOUT,
+        content_type='application/json',
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            f'failed to delete file {filename} of remote camera {camera_id} '
+            f'on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
 
-def del_media_group(local_config, group, media_type, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('deleting group "%(group)s" of remote camera %(id)s on %(url)s' % {
-            'group': group or 'ungrouped',
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
-    
-    path += '/%(media_type)s/%(id)s/delete_all/%(group)s/' % {
-            'media_type': media_type,
-            'id': camera_id,
-            'group': group}
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
 
-    request = _make_request(scheme, host, port, username, password, path, method='POST', data='{}',
-                            timeout=settings.REMOTE_REQUEST_TIMEOUT, content_type='application/json')
-
-    def on_response(response):
-        if response.error:
-            logging.error('failed to delete group "%(group)s" of remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'group': group or 'ungrouped',
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
-            
-            return callback(error=utils.pretty_http_error(response))
-        
-        callback()
-
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+    return utils.CommonExternalResponse()
 
 
-def exec_action(local_config, action, callback):
-    scheme, host, port, username, password, path, camera_id = _remote_params(local_config)
-    
-    logging.debug('executing action "%(action)s" of remote camera %(id)s on %(url)s' % {
-            'action': action,
-            'id': camera_id,
-            'url': pretty_camera_url(local_config)})
+async def del_media_group(
+    local_config, group: str, media_type
+) -> utils.CommonExternalResponse:
+    if '..' in group.split('/'):
+        raise ValueError(f'Path traversal detected in group "{group}"')
 
-    path += '/action/%(id)s/%(action)s/' % {
-            'action': action,
-            'id': camera_id}
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
 
-    request = _make_request(scheme, host, port, username, password, path, method='POST', data='{}',
-                            timeout=settings.REMOTE_REQUEST_TIMEOUT, content_type='application/json')
+    logging.debug(
+        'deleting group "{group}" of remote camera {id} on {url}'.format(
+            group=group or 'ungrouped',
+            id=camera_id,
+            url=pretty_camera_url(local_config),
+        )
+    )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to execute action "%(action)s" of remote camera %(id)s on %(url)s: %(msg)s' % {
-                    'action': action,
-                    'id': camera_id,
-                    'url': pretty_camera_url(local_config),
-                    'msg': utils.pretty_http_error(response)})
+    path += f'/{media_type}/{camera_id}/delete_all/{group}/'
 
-            return callback(error=utils.pretty_http_error(response))
-        
-        callback()
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path,
+        method='POST',
+        data='{}',
+        timeout=settings.REMOTE_REQUEST_TIMEOUT,
+        content_type='application/json',
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            'failed to delete group "{group}" of remote camera {id} on {url}: {msg}'.format(
+                group=group or 'ungrouped',
+                id=camera_id,
+                url=pretty_camera_url(local_config),
+                msg=utils.pretty_http_error(response),
+            )
+        )
 
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, _callback_wrapper(on_response))
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    return utils.CommonExternalResponse()
+
+
+async def exec_action(local_config, action) -> utils.CommonExternalResponse:
+    scheme, host, port, remote_secret, path, camera_id, verify = _remote_params(
+        local_config
+    )
+
+    logging.debug(
+        f'executing action "{action}" of remote camera {camera_id} on {pretty_camera_url(local_config)}'
+    )
+
+    path += f'/action/{camera_id}/{action}'
+
+    request = _make_request(
+        scheme,
+        host,
+        port,
+        remote_secret,
+        path,
+        method='POST',
+        data='{}',
+        timeout=settings.REMOTE_REQUEST_TIMEOUT,
+        content_type='application/json',
+        validate_cert=verify,
+    )
+    response = await _send_request(request)
+    if response.error:
+        logging.error(
+            f'failed to execute action "{action}" of remote camera {camera_id} '
+            f'on {pretty_camera_url(local_config)}: {utils.pretty_http_error(response)}'
+        )
+
+        return utils.CommonExternalResponse(error=utils.pretty_http_error(response))
+
+    return utils.CommonExternalResponse()

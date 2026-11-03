@@ -1,0 +1,19 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    target-branch: "dev"
+    labels:
+    - "CI/CD"
+
+  # For Python dependencies, a PEP 751 pyproject.lock is needed, which we do not maintain, intentionally.
+  #- package-ecosystem: "pip"
+  #  directory: "/"
+  #  schedule:
+  #    interval: "daily"
+  #  target-branch: "dev"
+  #  labels:
+  #  - "dependencies"

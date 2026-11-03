@@ -1,4 +1,3 @@
-
 # Copyright (c) 2013 Calin Crisan
 # This file is part of motionEye.
 #
@@ -6,228 +5,299 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
 
-import datetime
 import logging
 import os
 import re
 import signal
 import smtplib
 import socket
+import ssl
 import time
-
-from email import Encoders
+from collections.abc import Callable
+from datetime import datetime
+from email.encoders import encode_base64
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.MIMEMultipart import MIMEMultipart
-from email.MIMEBase import MIMEBase
-from email.Utils import formatdate
+from email.utils import formatdate, make_msgid
 
 from tornado.ioloop import IOLoop
 
-import settings
-
-import config
-import mediafiles
-import motionctl
-import tzctl
-
+from motioneye import config, mediafiles, motionctl, settings, utils
 
 messages = {
     'motion_start': 'Motion has been detected by camera "%(camera)s/%(hostname)s" at %(moment)s (%(timezone)s).'
 }
 
-subjects = {
-    'motion_start': 'motionEye: motion detected by "%(camera)s"'
-}
+subjects = {'motion_start': 'motionEye: motion detected by "%(camera)s"'}
 
 
-def send_mail(server, port, account, password, tls, _from, to, subject, message, files):
+def send_mail(
+    server,
+    port,
+    account,
+    password,
+    tls,
+    _from,
+    to,
+    subject,
+    message,
+    files,
+    *,
+    verify: bool = True,
+):
     conn = smtplib.SMTP(server, port, timeout=settings.SMTP_TIMEOUT)
     if tls:
-        conn.starttls()
-    
+        context = ssl.create_default_context()
+        if not verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        conn.starttls(context=context)
+
     if account and password:
         conn.login(account, password)
-    
+
     email = MIMEMultipart()
     email['Subject'] = subject
     email['From'] = _from
     email['To'] = ', '.join(to)
     email['Date'] = formatdate(localtime=True)
+    email['Message-ID'] = make_msgid()
     email.attach(MIMEText(message))
-    
+
     for name in reversed(files):
         part = MIMEBase('image', 'jpeg')
         with open(name, 'rb') as f:
             part.set_payload(f.read())
-        
-        Encoders.encode_base64(part)
-        part.add_header('Content-Disposition', 'attachment; filename="%s"' % os.path.basename(name))
+
+        encode_base64(part)
+        part.add_header(
+            'Content-Disposition', f'attachment; filename="{os.path.basename(name)}"'
+        )
         email.attach(part)
-    
+
     if files:
-        logging.debug('attached %d pictures' % len(files))
+        logging.debug(f'attached {len(files)} pictures')
 
     logging.debug('sending email message')
     conn.sendmail(_from, to, email.as_string())
-    conn.quit()
+
+    try:
+        conn.quit()
+
+    except (smtplib.SMTPException, OSError) as e:
+        # the message was already accepted by the server above; some servers
+        # (e.g. Gmail) drop the connection right after, so quit() fails - that
+        # must not be reported as a send failure (#3125)
+        logging.warning(f'failed to cleanly close the SMTP connection: {e}')
 
 
-def make_message(subject, message, camera_id, moment, timespan, callback):
+def make_message(
+    subject: str,
+    message: str,
+    camera_id: int,
+    moment: datetime,
+    timespan: int,
+    callback: Callable,
+) -> None:
     camera_config = config.get_camera(camera_id)
-    
+
     # we must start the IO loop for the media list subprocess polling
-    io_loop = IOLoop.instance()
+    io_loop = IOLoop.current()
 
     def on_media_files(media_files):
         io_loop.stop()
-        
+
         timestamp = time.mktime(moment.timetuple())
 
-        if media_files:
+        files: list | None = (
+            media_files.result() if hasattr(media_files, 'result') else media_files
+        )
+        if files is None:
+            logging.warning(
+                f'picture listing timed out after {settings.LIST_MEDIA_TIMEOUT}s; sending '
+                'notification without pictures; consider raising list_media_timeout_email'
+            )
+            files = []
+
+        if files:
             logging.debug('got media files')
 
             # filter out non-recent media files
-            media_files = [m for m in media_files if abs(m['timestamp'] - timestamp) < timespan]
-            media_files.sort(key=lambda m: m['timestamp'], reverse=True)
-            media_files = [os.path.join(camera_config['target_dir'], re.sub('^/', '', m['path'])) for m in media_files]
+            files = [m for m in files if abs(m['timestamp'] - timestamp) < timespan]
+            files.sort(key=lambda m: m['timestamp'], reverse=True)
+            files = [
+                os.path.join(camera_config['target_dir'], re.sub('^/', '', m['path']))
+                for m in files
+            ]
 
-            logging.debug('selected %d pictures' % len(media_files))
+            logging.debug(f'selected {len(files)} pictures')
 
         format_dict = {
             'camera': camera_config['camera_name'],
             'hostname': socket.gethostname(),
             'moment': moment.strftime('%Y-%m-%d %H:%M:%S'),
         }
-        
-        if settings.LOCAL_TIME_FILE:
-            format_dict['timezone'] = tzctl.get_time_zone()
 
-        else:
-            format_dict['timezone'] = 'local time'
+        format_dict['timezone'] = datetime.now().astimezone().tzname() or 'local time'
 
         logging.debug('creating email message')
-    
+
         m = message % format_dict
         s = subject % format_dict
         s = s.replace('\n', ' ')
-    
+
         m += '\n\n'
         m += 'motionEye.'
 
-        callback(s, m, media_files)
+        callback(s, m, files)
 
     if not timespan:
-        return on_media_files([])
-    
+        on_media_files([])
+
+        return
+
     logging.debug('waiting for pictures to be taken')
     time.sleep(timespan)  # give motion some time to create motion pictures
 
     prefix = None
-    picture_filename = camera_config.get('picture_filename')
-    snapshot_filename = camera_config.get('snapshot_filename')
+    picture_filename: str = camera_config.get('picture_filename', '')
+    snapshot_filename: str = camera_config.get('snapshot_filename', '')
 
-    if ((picture_filename or snapshot_filename) and
-        not picture_filename or picture_filename.startswith('%Y-%m-%d/') and
-        not snapshot_filename or snapshot_filename .startswith('%Y-%m-%d/')):
-
+    if (
+        (picture_filename or snapshot_filename)
+        and not picture_filename
+        or picture_filename.startswith('%Y-%m-%d/')
+        and not snapshot_filename
+        or snapshot_filename.startswith('%Y-%m-%d/')
+    ):
         prefix = moment.strftime('%Y-%m-%d')
-        logging.debug('narrowing down still images path lookup to %s' % prefix)
+        logging.debug(f'narrowing down still images path lookup to {prefix}')
 
-    mediafiles.list_media(camera_config, media_type='picture', prefix=prefix, callback=on_media_files)
-    
+    # only pictures within +/- timespan are ever used (see on_media_files),
+    # so let the listing skip the rest instead of formatting and piping a
+    # whole day of snapshots
+    event_timestamp: float = time.mktime(moment.timetuple())
+    fut = utils.cast_future(
+        mediafiles.list_media(
+            camera_config,
+            media_type='picture',
+            prefix=prefix,
+            min_timestamp=event_timestamp - timespan,
+            max_timestamp=event_timestamp + timespan,
+        )
+    )
+    fut.add_done_callback(on_media_files)
+
     io_loop.start()
+
+    return
 
 
 def parse_options(parser, args):
-    parser.add_argument('server', help='address of the SMTP server')
-    parser.add_argument('port', help='port for the SMTP connection')
-    parser.add_argument('account', help='SMTP account name (username)')
-    parser.add_argument('password', help='SMTP account password')
-    parser.add_argument('tls', help='"true" to use TLS')
-    parser.add_argument('from', help='the email from field')
-    parser.add_argument('to', help='the email recipient(s)')
-    parser.add_argument('msg_id', help='the identifier of the message')
+    # the settings are in the camera config
     parser.add_argument('motion_camera_id', help='the id of the motion camera')
     parser.add_argument('moment', help='the moment in ISO-8601 format')
-    parser.add_argument('timespan', help='picture collection time span')
+    options, extra = parser.parse_known_args(args)
+    if extra:  # without their values, they may be secrets
+        parser.error(
+            f'{len(extra)} unexpected arguments, '
+            'motionEye converts its own older commands when it starts'
+        )
 
-    return parser.parse_args(args)
-    
+    return options
+
 
 def main(parser, args):
-    import meyectl
-    
+    from motioneye import meyectl
+
     # the motion daemon overrides SIGCHLD,
     # so we must restore it here,
     # or otherwise media listing won't work
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
-    if len(args) == 12:
-        # backwards compatibility with older configs lacking "from" field
-        _from = 'motionEye on %s <%s>' % (socket.gethostname(), args[7].split(',')[0])
-        args = args[:7] + [_from] + args[7:]
-    
-    if not args[7]:
-        args[7] = 'motionEye on %s <%s>' % (socket.gethostname(), args[8].split(',')[0])
-
     options = parse_options(parser, args)
-    
-    meyectl.configure_logging('sendmail', options.log_to_file)
+
+    meyectl.configure_logging('sendmail')
 
     logging.debug('hello!')
 
-    options.port = int(options.port) 
+    camera_id = motionctl.motion_camera_id_to_camera_id(options.motion_camera_id)
+    stored = config.get_notification_settings(camera_id, config.SENDMAIL_KEYS)
+    if not stored:
+        logging.error(f'motion camera {options.motion_camera_id} has no email settings')
+        return
+
+    vars(options).update(stored, msg_id='motion_start')
+
+    if not options.sender:
+        address = options.to.split(',')[0]
+        options.sender = f'motionEye on {socket.gethostname()} <{address}>'
+
+    options.port = int(options.port)
     options.tls = options.tls.lower() == 'true'
+    options.verify = utils.verify_setting(options.verify)
     options.timespan = int(options.timespan)
     message = messages.get(options.msg_id)
     subject = subjects.get(options.msg_id)
-    options.moment = datetime.datetime.strptime(options.moment, '%Y-%m-%dT%H:%M:%S')
-    options.password = options.password.replace('\\;', ';')  # unescape password
-    
+    options.moment = datetime.strptime(options.moment, '%Y-%m-%dT%H:%M:%S')
+
     # do not wait too long for media list,
     # email notifications are critical
     settings.LIST_MEDIA_TIMEOUT = settings.LIST_MEDIA_TIMEOUT_EMAIL
-    
-    camera_id = motionctl.motion_camera_id_to_camera_id(options.motion_camera_id)
-    _from = getattr(options, 'from')
 
-    logging.debug('server = %s' % options.server)
-    logging.debug('port = %s' % options.port)
-    logging.debug('account = %s' % options.account)
+    logging.debug(f'server = {options.server}')
+    logging.debug(f'port = {options.port}')
+    logging.debug(f'account = {options.account}')
     logging.debug('password = ******')
-    logging.debug('server = %s' % options.server)
-    logging.debug('tls = %s' % str(options.tls).lower())
-    logging.debug('from = %s' % _from)
-    logging.debug('to = %s' % options.to)
-    logging.debug('msg_id = %s' % options.msg_id)
-    logging.debug('motion_camera_id = %s' % options.motion_camera_id)
-    logging.debug('camera_id = %s' % camera_id)
-    logging.debug('moment = %s' % options.moment.strftime('%Y-%m-%d %H:%M:%S'))
-    logging.debug('smtp timeout = %d' % settings.SMTP_TIMEOUT)
-    logging.debug('timespan = %d' % options.timespan)
-    
+    logging.debug(f'server = {options.server}')
+    logging.debug(f'tls = {str(options.tls).lower()}')
+    logging.debug(f'verify = {str(options.verify).lower()}')
+    logging.debug(f'from = {options.sender}')
+    logging.debug(f'to = {options.to}')
+    logging.debug(f'msg_id = {options.msg_id}')
+    logging.debug(f'motion_camera_id = {options.motion_camera_id}')
+    logging.debug(f'camera_id = {camera_id}')
+    logging.debug(f'moment = {options.moment.strftime("%Y-%m-%d %H:%M:%S")}')
+    logging.debug(f'smtp timeout = {settings.SMTP_TIMEOUT}')
+    logging.debug(f'timespan = {options.timespan}')
+
     to = [t.strip() for t in re.split('[,;| ]', options.to)]
     to = [t for t in to if t]
 
     def on_message(subject, message, files):
         try:
             logging.info('sending email')
-            send_mail(options.server, options.port, options.account, options.password,
-                      options.tls, _from, to, subject, message, files or [])
+            send_mail(
+                options.server,
+                options.port,
+                options.account,
+                options.password,
+                options.tls,
+                options.sender,
+                to,
+                subject,
+                message,
+                files or [],
+                verify=options.verify,
+            )
             logging.info('email sent')
 
         except Exception as e:
-            logging.error('failed to send mail: %s' % e, exc_info=True)
+            logging.error(f'failed to send email: {e}')
 
         logging.debug('bye!')
-    
-    make_message(subject, message, camera_id, options.moment, options.timespan, on_message)
+
+    make_message(
+        subject, message, camera_id, options.moment, options.timespan, on_message
+    )

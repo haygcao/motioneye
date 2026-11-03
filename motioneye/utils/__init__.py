@@ -1,0 +1,674 @@
+# Copyright (c) 2020 Vlsarro
+# Copyright (c) 2013 Calin Crisan
+# This file is part of motionEye.
+#
+# motionEye is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
+
+import base64
+import hashlib
+import logging
+import os
+import re
+import ssl
+import subprocess
+import time
+from collections import namedtuple
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from http.client import HTTPResponse
+from typing import Any, cast
+from urllib.parse import urlparse, urlsplit
+from urllib.request import Request
+from urllib.request import urlopen as _urlopen
+
+from PIL import Image, ImageDraw
+from tornado.concurrent import Future
+from tornado.httputil import parse_cookie
+from tornado.ioloop import IOLoop
+from tornado.web import HTTPError
+
+from motioneye import settings
+
+_SPECIAL_COOKIE_NAMES = {'expires', 'domain', 'path', 'secure', 'httponly'}
+
+MASK_WIDTH = 32
+
+COMMON_RESOLUTIONS = [
+    (320, 200),
+    (320, 240),
+    (640, 480),
+    (800, 480),
+    (800, 600),
+    (1024, 576),
+    (1024, 600),
+    (1024, 768),
+    (1280, 720),
+    (1280, 768),
+    (1280, 800),
+    (1280, 960),
+    (1280, 1024),
+    (1440, 900),
+    (1440, 960),
+    (1440, 1024),
+    (1600, 1200),
+    (1920, 1080),
+    (3840, 2160),
+]
+
+GetCamerasResponse = namedtuple('GetCamerasResponse', ('cameras', 'error'))
+GetConfigResponse = namedtuple('GetConfigResponse', ('remote_ui_config', 'error'))
+GetMotionDetectionResult = namedtuple('GetMotionDetectionResult', ('enabled', 'error'))
+
+
+@dataclass
+class GetCurrentPictureResponse:
+    motion_detected: bool = False
+    motion_detection: bool | None = None
+    capture_fps: Any = None
+    monitor_info: Any = None
+    picture: Any = None
+    error: Any = None
+
+
+@dataclass
+class ListMediaResponse:
+    media_list: list | None = None
+    error: str | None = None
+
+
+@dataclass
+class CommonExternalResponse:
+    result: Any = None
+    error: Any = None
+
+
+def cast_future(obj: Awaitable[Any]) -> Future:
+    return cast(Future, obj)
+
+
+def spawn_callback_timeout_wrapper(
+    callback: Callable, *args: Any, **kwargs: Any
+) -> None:
+    IOLoop.current().spawn_callback(callback, *args, **kwargs)
+
+
+def pretty_size(size):
+    if size < 1024:  # less than 1kB
+        unit = 'B'
+
+    elif size < 1024 * 1024:  # less than 1MB
+        size, unit = size / 1024.0, 'kB'
+
+    elif size < 1024 * 1024 * 1024:  # less than 1GB
+        size, unit = size / 1024.0 / 1024, 'MB'
+
+    else:  # greater than or equal to 1GB
+        size, unit = size / 1024.0 / 1024 / 1024, 'GB'
+
+    return f'{size:.1f} {unit}'
+
+
+class RemoteError(Exception):
+    pass
+
+
+def pretty_error_message(msg) -> str:
+    return re.sub(r'[\x00-\x1f\x7f-\x9f]+', ' ', str(msg))[:200].strip()
+
+
+def pretty_http_error(response):
+    if response.code == 401:
+        return 'authentication failed'
+
+    if response.error is None:
+        return 'ok'
+
+    if isinstance(response.error, RemoteError):
+        return pretty_error_message(str(response.error))
+
+    msg = str(response.error)
+
+    if msg == 'Authentication Error':
+        return 'authentication failed'
+
+    if msg.startswith('HTTP '):
+        msg = msg.split(':', 1)[-1].strip()
+
+    if msg.startswith('[Errno '):
+        msg = msg.split(']', 1)[-1].strip()
+
+    if 'timeout' in msg.lower() or 'timed out' in msg.lower():
+        msg = 'request timed out'
+
+    return pretty_error_message(msg)
+
+
+def make_str(s):
+    if isinstance(s, str):
+        return s
+
+    try:
+        return str(s)
+
+    except Exception:
+        try:
+            return str(s, encoding='utf8').encode('utf8')
+
+        except Exception:
+            return str(s).encode('utf8')
+
+
+def split_semicolon(s):
+    parts = s.split(';')
+    merged_parts = []
+    for p in parts:
+        if merged_parts and merged_parts[-1].endswith('\\'):  # also for empty parts
+            merged_parts[-1] = merged_parts[-1][:-1] + ';' + p
+
+        elif merged_parts and not p:  # keep ;; as in case ... esac
+            merged_parts[-1] += ';'
+
+        else:
+            merged_parts.append(p)
+
+    if not merged_parts:
+        return []
+
+    return [p.strip() for p in merged_parts]
+
+
+def get_disk_usage(path):
+    logging.debug(f'getting disk usage for path {path} ...')
+
+    try:
+        result = os.statvfs(path)
+
+    except OSError as e:
+        logging.error(f'failed to execute statvfs: {e}')
+
+        return None
+
+    block_size = result.f_frsize
+    free_blocks = result.f_bfree
+    total_blocks = result.f_blocks
+
+    free_size = free_blocks * block_size
+    total_size = total_blocks * block_size
+    used_size = total_size - free_size
+
+    return used_size, total_size
+
+
+def is_local_motion_camera(config):
+    """Tells if a camera is managed by the local motion instance."""
+    return bool(
+        config.get('videodevice')
+        or config.get('video_device')
+        or config.get('netcam_url')
+        or config.get('mmalcam_name')
+    )
+
+
+def is_remote_camera(config):
+    """Tells if a camera is managed by a remote motionEye server."""
+    return config.get('@proto') == 'motioneye'
+
+
+def is_v4l2_camera(config):
+    """Tells if a camera is a v4l2 device managed by the local motion instance."""
+    return bool(config.get('videodevice'))
+
+
+def is_mmal_camera(config):
+    """Tells if a camera is mmal device managed by the local motion instance."""
+    return bool(config.get('mmalcam_name'))
+
+
+def is_net_camera(config):
+    """Tells if a camera is a network camera managed by the local motion instance."""
+    return bool(config.get('netcam_url'))
+
+
+def is_simple_mjpeg_camera(config):
+    """Tells if a camera is a simple MJPEG camera not managed by any motion instance."""
+    return bool(config.get('@proto') == 'mjpeg')
+
+
+def parse_cookies(cookies_headers: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+
+    for cookie in cookies_headers:
+        for name, value in parse_cookie(cookie).items():
+            if name.lower() in _SPECIAL_COOKIE_NAMES:
+                continue
+            parsed[name] = value
+
+    return parsed
+
+
+def build_basic_header(username: str, password: str) -> str:
+    return f'Basic {base64.b64encode(f"{username}:{password}".encode()).decode()}'
+
+
+def build_digest_header(method, url, username, password, state):
+    realm = state['realm']
+    nonce = state['nonce']
+    last_nonce = state.get('last_nonce', '')
+    nonce_count = state.get('nonce_count', 0)
+    qop = state.get('qop')
+    algorithm = state.get('algorithm')
+    opaque = state.get('opaque')
+
+    if algorithm is None:
+        _algorithm = 'MD5'
+
+    else:
+        _algorithm = algorithm.upper()
+
+    if _algorithm == 'MD5' or _algorithm == 'MD5-SESS':
+
+        def md5_utf8(x):
+            if isinstance(x, str):
+                x = x.encode('utf-8')
+            return hashlib.md5(x).hexdigest()  # nosec: B324
+
+        hash_utf8 = md5_utf8
+
+    else:  # _algorithm == 'SHA'
+
+        def sha_utf8(x):
+            if isinstance(x, str):
+                x = x.encode('utf-8')
+            return hashlib.sha1(x).hexdigest()  # nosec: B324
+
+        hash_utf8 = sha_utf8
+
+    def KD(s, d):
+        return hash_utf8(f"{s}:{d}")
+
+    p_parsed = urlparse(url)
+    path = p_parsed.path
+    if p_parsed.query:
+        path += '?' + p_parsed.query
+
+    A1 = f'{username}:{realm}:{password}'
+    A2 = f'{method}:{path}'
+
+    HA1 = hash_utf8(A1)
+    HA2 = hash_utf8(A2)
+
+    if nonce == last_nonce:
+        nonce_count += 1
+
+    else:
+        nonce_count = 1
+
+    ncvalue = f'{nonce_count:08x}'
+    s = str(nonce_count).encode('utf-8')
+    s += nonce.encode('utf-8')
+    s += time.ctime().encode('utf-8')
+    s += os.urandom(8)
+
+    cnonce = hashlib.sha1(s).hexdigest()[:16]  # nosec B324
+    if _algorithm == 'MD5-SESS':
+        HA1 = hash_utf8(f'{HA1}:{nonce}:{cnonce}')
+
+    if qop is None:
+        respdig = KD(HA1, f"{nonce}:{HA2}")
+
+    elif qop == 'auth' or 'auth' in qop.split(','):
+        noncebit = "{}:{}:{}:{}:{}".format(nonce, ncvalue, cnonce, 'auth', HA2)
+        respdig = KD(HA1, noncebit)
+
+    else:
+        return None
+
+    last_nonce = nonce
+
+    base = f'username="{username}", realm="{realm}", nonce="{nonce}", uri="{path}", response="{respdig}"'
+    if opaque:
+        base += f', opaque="{opaque}"'
+    if algorithm:
+        base += f', algorithm="{algorithm}"'
+    if qop:
+        base += f', qop=auth, nc={ncvalue}, cnonce="{cnonce}"'
+
+    state['last_nonce'] = last_nonce
+    state['nonce_count'] = nonce_count
+
+    return f'Digest {base}'
+
+
+def verify_setting(value) -> bool:
+    """A "verify certificate" setting as stored in a config file or sent by
+    the UI: only an explicit off value turns the check off; a missing, empty
+    or unknown value keeps it on."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ('false', 'off', '0', 'no')
+
+    return bool(value)
+
+
+def urlopen(request: Request, *, verify: bool = True, **kwargs) -> HTTPResponse:
+    scheme: str = urlsplit(request.full_url).scheme
+    if scheme not in ('http', 'https'):
+        raise ValueError(f'Unsupported URL scheme: {scheme!r}')
+
+    if not verify:
+        # the caller's switch: no certificate or host-name check for this connection
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        kwargs['context'] = context
+
+    return _urlopen(request, **kwargs)  # nosec: B310
+
+
+def build_editable_mask_file(
+    camera_id, mask_class, mask_lines, capture_width=None, capture_height=None
+):
+    if not mask_lines:
+        return ''
+
+    width = mask_lines[0]
+    height = mask_lines[1]
+    mask_lines = mask_lines[2:]
+
+    logging.debug(
+        f'building editable {mask_class} mask for camera with id {camera_id} ({width}x{height})'
+    )
+
+    # horizontal rectangles
+    nx = MASK_WIDTH  # number of rectangles
+    if width % nx:
+        nx -= 1
+        rx = width % nx  # remainder
+
+    else:
+        rx = 0
+
+    rw = width // nx  # rectangle width
+
+    # vertical rectangles
+    ny = mask_height = height * MASK_WIDTH // width  # number of rectangles
+    if height % ny:
+        ny -= 1
+        ry = height % ny  # remainder
+
+    else:
+        ry = 0
+
+    # if mask not present, generate an empty mask
+    if not mask_lines:
+        mask_lines = [0] * mask_height
+
+    # scale the mask vertically in case the aspect ratio has changed
+    # since the last time the mask has been generated
+    if ny == len(mask_lines):
+
+        def line_index_func(y):
+            return y
+
+    else:
+
+        def line_index_func(y):
+            return (len(mask_lines) - 1) * y / ny
+
+    rh = height // ny  # rectangle height
+
+    # draw the actual mask image content
+    im = Image.new('L', (width, height), 255)  # all white
+    dr = ImageDraw.Draw(im)
+
+    for y in range(ny):
+        line = mask_lines[int(line_index_func(y))]
+        for x in range(nx):
+            if line & (1 << (MASK_WIDTH - 1 - x)):
+                dr.rectangle(
+                    (x * rw, y * rh, (x + 1) * rw - 1, (y + 1) * rh - 1), fill=0
+                )
+
+        if rx and line & 1:
+            dr.rectangle((nx * rw, y * rh, nx * rw + rx - 1, (y + 1) * rh - 1), fill=0)
+
+    if ry:
+        line = mask_lines[int(line_index_func(ny))]
+        for x in range(nx):
+            if line & (1 << (MASK_WIDTH - 1 - x)):
+                dr.rectangle(
+                    (x * rw, ny * rh, (x + 1) * rw - 1, ny * rh + ry - 1), fill=0
+                )
+
+        if rx and line & 1:
+            dr.rectangle((nx * rw, ny * rh, nx * rw + rx - 1, ny * rh + ry - 1), fill=0)
+
+    #    file_name = os.path.join(settings.CONF_PATH, 'mask_%s.pgm' % camera_id)
+    file_name = build_mask_file_name(camera_id, mask_class)
+
+    # resize the image if necessary
+    if capture_width and capture_height and im.size != (capture_width, capture_height):
+        logging.debug(
+            f'editable mask needs resizing from {im.size[0]}x{im.size[1]} to {capture_width}x{capture_height}'
+        )
+
+        im = im.resize((capture_width, capture_height))
+
+    im.save(file_name, 'ppm')
+
+    return file_name
+
+
+def build_mask_file_name(camera_id, mask_class):
+    file_name = (
+        f'mask_{camera_id}.pgm'
+        if mask_class == 'motion'
+        else f'mask_{camera_id}_{mask_class}.pgm'
+    )
+    full_path = os.path.join(settings.CONF_PATH, file_name)
+
+    return full_path
+
+
+def parse_editable_mask_file(
+    camera_id, mask_class, capture_width=None, capture_height=None
+):
+    # capture_width and capture_height arguments represent the current size
+    # of the camera image, as it might be different from that of the associated mask;
+    # they can be null (e.g. netcams)
+
+    file_name = build_mask_file_name(camera_id, mask_class)
+
+    logging.debug(
+        f'parsing editable mask {mask_class} for camera with id {camera_id}: {file_name}'
+    )
+
+    # read the image file
+    try:
+        im = Image.open(file_name)
+
+    except Exception as e:
+        logging.error(f'failed to read mask file {file_name}: {e}')
+
+        # empty mask
+        return [0] * (MASK_WIDTH * 10)
+
+    if capture_width and capture_height:
+        # resize the image if necessary
+        if im.size != (capture_width, capture_height):
+            logging.debug(
+                f'editable mask needs resizing from {im.size[0]}x{im.size[1]} to {capture_width}x{capture_height}'
+            )
+
+            im = im.resize((capture_width, capture_height))
+
+        width, height = capture_width, capture_height
+
+    else:
+        logging.debug(f'using mask size from file: {im.size[0]}x{im.size[1]}')
+
+        width, height = im.size
+
+    pixels = list(im.getdata())
+
+    # horizontal rectangles
+    nx = MASK_WIDTH  # number of rectangles
+    if width % nx:
+        nx -= 1
+        rx = width % nx  # remainder
+
+    else:
+        rx = 0
+
+    rw = width // nx  # rectangle width
+
+    # vertical rectangles
+    ny = height * MASK_WIDTH // width  # number of rectangles
+    if height % ny:
+        ny -= 1
+        ry = height % ny  # remainder
+
+    else:
+        ry = 0
+
+    rh = height // ny  # rectangle height
+
+    # parse the image contents and build the mask lines
+    mask_lines = [width, height]
+    for y in range(ny):
+        bits = []
+        for x in range(nx):
+            px = int((x + 0.5) * rw)
+            py = int((y + 0.5) * rh)
+            pixel = pixels[py * width + px]
+            bits.append(not bool(pixel))
+
+        if rx:
+            px = int(nx * rw + rx / 2)
+            py = int((y + 0.5) * rh)
+            pixel = pixels[py * width + px]
+            bits.append(not bool(pixel))
+
+        # build the binary packed mask line
+        line = 0
+        for i, bit in enumerate(bits):
+            if bit:
+                line |= 1 << (MASK_WIDTH - 1 - i)
+
+        mask_lines.append(line)
+
+    if ry:
+        bits = []
+        for x in range(nx):
+            px = int((x + 0.5) * rw)
+            py = int(ny * rh + ry / 2)
+            pixel = pixels[py * width + px]
+            bits.append(not bool(pixel))
+
+        if rx:
+            px = int(nx * rw + rx / 2)
+            py = int(ny * rh + ry / 2)
+            pixel = pixels[py * width + px]
+            bits.append(not bool(pixel))
+
+        # build the binary packed mask line
+        line = 0
+        for i, bit in enumerate(bits):
+            if bit:
+                line |= 1 << (MASK_WIDTH - 1 - i)
+
+        mask_lines.append(line)
+
+    return mask_lines
+
+
+def call_subprocess(
+    args,
+    stdin=None,
+    input=None,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    capture_output=False,
+    shell=False,
+    cwd=None,
+    timeout=None,
+    check=True,
+    encoding='utf-8',
+    errors=None,
+    text=None,
+    env=None,
+) -> str:
+    """subprocess.run wrapper to return output as a decoded string"""
+    return subprocess.run(
+        args,
+        stdin=stdin,
+        input=input,
+        stdout=stdout,
+        stderr=stderr,
+        capture_output=capture_output,
+        shell=shell,  # nosec: B602
+        cwd=cwd,
+        timeout=timeout,
+        check=check,
+        encoding=encoding,
+        errors=errors,
+        text=text,
+        env=env,
+    ).stdout.strip()
+
+
+def validate_paths(
+    *paths: str | None,
+    camera_id: str | None = None,
+    target_dir: str | None = None,
+) -> None:
+    # Obtain camera dir from optional named arguments
+    camera_dir: str | None = None
+    if target_dir is not None:
+        camera_dir = os.path.realpath(target_dir) + os.sep
+
+    elif camera_id is not None:
+        from motioneye.config import get_camera
+
+        camera_config: dict = get_camera(int(camera_id))
+        if is_local_motion_camera(camera_config):
+            camera_dir = os.path.realpath(camera_config['target_dir']) + os.sep
+
+    # Check paths which are not None or empty
+    for path in paths:
+        if path:
+            if path.startswith('/'):
+                raise HTTPError(
+                    403,
+                    f'Absolute path "{path}" detected',
+                    reason='Absolute path detected',
+                )
+
+            if '..' in path.split('/'):
+                raise HTTPError(
+                    403,
+                    f'Path traversal detected in "{path}"',
+                    reason='Path traversal detected',
+                )
+
+            if camera_dir is not None and not os.path.realpath(
+                os.path.join(camera_dir, path)
+            ).startswith(camera_dir):
+                raise HTTPError(
+                    403,
+                    f'Path "{path}" escapes camera directory "{camera_dir}"',
+                    reason='Path escapes camera directory',
+                )

@@ -1,0 +1,271 @@
+# Copyright (c) 2020 Vlsarro
+# Copyright (c) 2013 Calin Crisan
+# This file is part of motionEye.
+#
+# motionEye is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
+
+import functools
+import logging
+import re
+import socket
+
+from tornado.concurrent import Future
+from tornado.ioloop import IOLoop
+from tornado.iostream import IOStream
+
+from motioneye import settings
+from motioneye.utils import (
+    GetCamerasResponse,
+    build_basic_header,
+    cast_future,
+    pretty_error_message,
+)
+from motioneye.utils.http import RtspUrl
+
+__all__ = ('test_rtsp_url',)
+
+
+def test_rtsp_url(data: dict) -> Future[GetCamerasResponse]:
+    url_obj = RtspUrl.from_dict(data)
+    url = str(url_obj)
+
+    called = [False]
+    send_auth = [False]
+    timeout: list[object | None] = [None]
+    stream: IOStream | None = None
+
+    io_loop = IOLoop.current()
+    future: Future = Future()
+
+    def connect() -> None:
+        nonlocal stream
+        if send_auth[0]:
+            logging.debug(f'testing rtsp netcam at {url} (this time with credentials)')
+
+        else:
+            logging.debug(f'testing rtsp netcam at {url}')
+
+        if stream is not None:
+            try:
+                stream.set_close_callback(None)  # not an error when reconnecting
+                stream.close()
+
+            except Exception:  # nosec: B110 # noqa: S110
+                pass  # already closed or closing failed, nothing we can do
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        s.settimeout(settings.MJPG_CLIENT_TIMEOUT)
+        stream = IOStream(s)
+        stream.set_close_callback(on_close)
+        f = stream.connect((url_obj.host, int(url_obj.port)))
+        f.add_done_callback(on_connect)
+
+        timeout[0] = io_loop.call_later(
+            settings.MJPG_CLIENT_TIMEOUT,
+            functools.partial(on_connect, f, _timeout=True),
+        )
+
+    def on_connect(f: Future, _timeout: bool = False) -> None:
+        try:
+            io_loop.remove_timeout(timeout[0])
+            s = f.result()
+        except Exception:
+            logging.exception('[ON_CONNECT] Stream connection error occurred')
+            if _timeout:
+                return handle_error('timeout connecting to rtsp netcam')
+            else:
+                return handle_error('failed to connect to rtsp netcam')
+        else:
+            logging.debug('connected to rtsp netcam')
+
+            lines = [f'OPTIONS {url} RTSP/1.0', 'CSeq: 1', 'User-Agent: motionEye']
+
+            if url_obj.username and send_auth[0]:
+                auth_header = 'Authorization: ' + build_basic_header(
+                    url_obj.username, url_obj.password or ''
+                )
+                lines.append(auth_header)
+
+            lines += ['', '']
+
+            write_future = s.write('\r\n'.join(lines).encode('utf-8'))
+            write_future.add_done_callback(seek_rtsp)
+
+            return None
+
+    def seek_rtsp(f: Future):
+        try:
+            f.result()
+        except Exception:
+            logging.exception('[SEEK_RTSP] Error occurred')
+            if check_error():
+                return None
+        else:
+            if stream is None:
+                return handle_error('connection closed')
+
+            r_future = cast_future(stream.read_until_regex(rb'RTSP/1.0 \d+ '))
+            r_future.add_done_callback(on_rtsp)
+            timeout[0] = io_loop.call_later(
+                settings.MJPG_CLIENT_TIMEOUT,
+                functools.partial(on_rtsp, r_future),
+            )
+
+        return None
+
+    def on_rtsp(f: Future):
+        try:
+            io_loop.remove_timeout(timeout[0])
+            data = f.result()
+        except Exception:
+            logging.exception('[ON_RTSP] Error occurred')
+            handle_error('timeout waiting for rtsp netcam response')
+        else:
+            if not data:
+                handle_error('timeout waiting for rtsp netcam response')
+
+            if data.endswith(b'200 '):
+                seek_server()
+
+            elif data.endswith(b'401 '):
+                if not url_obj.username or send_auth[0]:
+                    # either credentials not supplied, or already sent
+                    handle_error('authentication failed')
+
+                else:
+                    seek_www_authenticate()
+
+            else:
+                handle_error(f'rtsp netcam returned erroneous response: {data}')
+
+    def seek_server():
+        if check_error():
+            return
+
+        future = stream.read_until_regex(b'Server: .*')
+
+        def f(f):
+            on_server(f.result())
+
+        future.add_done_callback(f)
+
+        timeout[0] = io_loop.call_later(1, on_server)
+
+    def on_server(data=None):
+        io_loop.remove_timeout(timeout[0])
+        if data:
+            identifier = pretty_error_message(
+                re.findall('Server: (.*)', data.decode(errors='replace'))[0]
+            )
+            logging.debug(f'rtsp netcam identifier is "{identifier}"')
+
+        else:
+            identifier = None
+            logging.debug('no rtsp netcam identifier')
+
+        handle_success(identifier)
+
+    def seek_www_authenticate():
+        if check_error():
+            return
+
+        f = cast_future(stream.read_until_regex(b'WWW-Authenticate: .*'))
+        f.add_done_callback(on_www_authenticate)
+
+        timeout[0] = io_loop.call_later(1, functools.partial(on_www_authenticate, f))
+
+    def on_www_authenticate(f: Future):
+        auth_timeout_msg = 'timeout waiting for rtsp netcam response'
+        auth_timeout_log_msg = 'timeout waiting for rtsp auth scheme'
+        try:
+            io_loop.remove_timeout(timeout[0])
+            data = f.result()
+        except Exception:
+            logging.error(f'[ON_WWW_AUTH] {auth_timeout_log_msg}')
+            handle_error(f'{auth_timeout_msg}')
+        else:
+            if data:
+                schemes = re.findall(rb'WWW-Authenticate: ([^\s]+)', data)
+                scheme = schemes[0].decode(errors='replace') if schemes else ''
+                logging.debug(f'rtsp netcam auth scheme: {scheme}')
+                if scheme.lower() == 'basic':
+                    send_auth[0] = True
+                    connect()
+
+                else:
+                    logging.debug(
+                        'rtsp auth scheme digest not supported, considering credentials ok'
+                    )
+                    handle_success('(unknown) ')
+
+            else:
+                logging.error(f'{auth_timeout_log_msg}')
+                handle_error(f'{auth_timeout_msg}')
+
+    def on_close():
+        if called[0]:
+            return
+
+        if not check_error():
+            handle_error('connection closed')
+
+    def handle_success(identifier):
+        if called[0]:
+            return
+
+        called[0] = True
+        cameras = []
+        if identifier:
+            identifier = ' ' + identifier
+
+        else:
+            identifier = ''
+
+        cameras.append({'id': 'tcp', 'name': f'{identifier}RTSP/TCP Camera'})
+        cameras.append({'id': 'udp', 'name': f'{identifier}RTSP/UDP Camera'})
+
+        future.set_result(GetCamerasResponse(cameras, None))
+
+    def handle_error(e):
+        if called[0]:
+            return
+
+        called[0] = True
+        logging.error(f'rtsp client error: {e}')
+
+        try:
+            stream.close()
+
+        except Exception:  # nosec: B110 # noqa: S110
+            pass  # already closed or closing failed, nothing we can do
+
+        future.set_result(GetCamerasResponse(None, error=e))
+
+    def check_error():
+        error = getattr(stream, 'error', None)
+        if error and getattr(error, 'strerror', None):
+            handle_error(error.strerror)
+            return True
+
+        if stream and stream.socket is None:
+            handle_error('connection closed')
+            stream.close()
+
+            return True
+
+        return False
+
+    connect()
+    return future

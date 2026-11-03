@@ -1,4 +1,3 @@
-
 # Copyright (c) 2013 Calin Crisan
 # This file is part of motionEye.
 #
@@ -6,153 +5,90 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
 
-import calendar
-import cPickle
-import datetime
 import logging
-import multiprocessing
-import os
-import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gettext import gettext as _  # noqa: TC004
 
 from tornado.ioloop import IOLoop
 
-import settings
+# Use a single thread only to avoid possible collisions. Otherwise we'd
+# need to manually prevent e.g. concurrent upload service config writes.
+_POOL_SIZE: int = 1
+_MAX_TASKS: int = 100
+
+_pool: ThreadPoolExecutor | None = None
+_pending_tasks: int = 0
 
 
-_INTERVAL = 2
-_STATE_FILE_NAME = 'tasks.pickle'
-_MAX_TASKS = 100
-
-# we must be sure there's only one extra process that handles all tasks
-# TODO replace the pool with one simple thread
-_POOL_SIZE = 1
-
-_tasks = []
-_pool = None
+def start() -> None:
+    global _pool
+    _pool = ThreadPoolExecutor(max_workers=_POOL_SIZE)
+    logging.info(_('taskoj komenciĝis'))
 
 
-def start():
+def stop() -> None:
     global _pool
 
-    io_loop = IOLoop.instance()
-    io_loop.add_timeout(datetime.timedelta(seconds=_INTERVAL), _check_tasks)
-    
-    def init_pool_process():
-        import signal
-
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-
-    _load()
-    _pool = multiprocessing.Pool(_POOL_SIZE, initializer=init_pool_process)
-
-
-def stop():
-    global _pool
-    
+    # close pool gracefully, letting tasks in pool finish
+    # but set global _pool to None to not add new tasks
+    pool: ThreadPoolExecutor | None = _pool
     _pool = None
 
-
-def add(when, func, tag=None, callback=None, **params):
-    if len(_tasks) >= _MAX_TASKS:
-        return logging.error('the maximum number of tasks (%d) has been reached' % _MAX_TASKS)
-    
-    now = time.time()
-    
-    if isinstance(when, int):  # delay, in seconds
-        when += now
-        
-    elif isinstance(when, datetime.timedelta):
-        when = now + when.total_seconds()
-        
-    elif isinstance(when, datetime.datetime):
-        when = calendar.timegm(when.timetuple())
-
-    i = 0
-    while i < len(_tasks) and _tasks[i][0] <= when:
-        i += 1
-
-    logging.debug('adding task "%s" in %d seconds' % (tag or func.func_name, when - now))
-    _tasks.insert(i, (when, func, tag, callback, params))
-
-    _save()
+    if pool is not None:
+        pool.shutdown(wait=True)
+        logging.info(_('taskoj haltis'))
 
 
-def _check_tasks():
-    io_loop = IOLoop.instance()
-    io_loop.add_timeout(datetime.timedelta(seconds=_INTERVAL), _check_tasks)
-    
-    now = time.time()
-    changed = False
-    while _tasks and _tasks[0][0] <= now:
-        (when, func, tag, callback, params) = _tasks.pop(0)  # @UnusedVariable
-        
-        logging.debug('executing task "%s"' % tag or func.func_name)
-        _pool.apply_async(func, kwds=params, callback=callback if callable(callback) else None)
+def add(delay: int, func, tag: str | None = None, **params) -> None:
+    global _pending_tasks
+    name: str = tag or func.__name__
 
-        changed = True
-    
-    if changed:
-        _save()
-
-
-def _load():
-    global _tasks
-    
-    _tasks = []
-
-    file_path = os.path.join(settings.CONF_PATH, _STATE_FILE_NAME)
-    
-    if os.path.exists(file_path):
-        logging.debug('loading tasks from "%s"...' % file_path)
-    
-        try:
-            f = open(file_path, 'r')
-        
-        except Exception as e:
-            logging.error('could not open tasks file "%s": %s' % (file_path, e))
-            
-            return
-        
-        try:
-            _tasks = cPickle.load(f)
-
-        except Exception as e:
-            logging.error('could not read tasks from file "%s": %s' % (file_path, e))
-
-        finally:
-            f.close()
-            
-
-def _save():
-    file_path = os.path.join(settings.CONF_PATH, _STATE_FILE_NAME)
-
-    logging.debug('saving tasks to "%s"...' % file_path)
-
-    try:
-        f = open(file_path, 'w')
-
-    except Exception as e:
-        logging.error('could not open tasks file "%s": %s' % (file_path, e))
-        
+    if _pending_tasks >= _MAX_TASKS:
+        logging.error(f'skipping task {name!r}: limit of {_MAX_TASKS} tasks reached')
         return
 
-    try:
-        # don't save tasks that have a callback
-        tasks = [t for t in _tasks if not t[3]]
-        cPickle.dump(tasks, f)
+    if delay > 0:
+        logging.debug(f'adding task {name!r} in {delay} seconds')
+        IOLoop.current().call_later(delay, _submit_task, func, name, params)
+    else:
+        _submit_task(func, name, params)
 
-    except Exception as e:
-        logging.error('could not save tasks to file "%s": %s' % (file_path, e))
+    _pending_tasks += 1
 
-    finally:
-        f.close()
+
+def _submit_task(func, name: str, params: dict) -> None:
+    global _pending_tasks
+
+    if _pool is None:
+        _pending_tasks -= 1
+        logging.error(f'skipping task {name!r}: tasks pool not ready yet/anymore')
+        return
+
+    logging.debug(f'executing task {name!r}')
+    _pool.submit(func, **params).add_done_callback(_log_task_result)
+
+
+def _log_task_result(future) -> None:
+    global _pending_tasks
+    _pending_tasks -= 1
+
+    if not future.cancelled():
+        e = future.exception()
+        if e is not None:
+            logging.error(
+                'scheduled task failed',
+                exc_info=(type(e), e, e.__traceback__),
+            )

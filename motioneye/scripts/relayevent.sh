@@ -1,35 +1,32 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 
 if [ -z "$3" ]; then
     echo "Usage: $0 <motioneye.conf> <event> <motion_camera_id> [filename]"
-    exit -1
+    exit 1
 fi
 
 timeout=5
 
 motioneye_conf=$1
 if [ -f "$motioneye_conf" ]; then
-    port=$(cat $motioneye_conf | grep -E '^port' | cut -d ' ' -f 2)
-    conf_path=$(cat $motioneye_conf | grep -E '^conf_path' | cut -d ' ' -f 2)
-    if [ -n "$conf_path" ]; then
+    port=$(grep '^port' "$motioneye_conf" | cut -d ' ' -f 2)
+    conf_path=$(grep '^conf_path' "$motioneye_conf" | cut -d ' ' -f 2)
+    if [ "$conf_path" ]; then
         motion_conf="$conf_path/motion.conf"
         if [ -r "$motion_conf" ]; then
-            username=$(cat $motion_conf | grep 'admin_username' | cut -d ' ' -f 3)
-            password=$(cat $motion_conf | grep 'admin_password' | cut -d ' ' -f 3 | sed -r 's/[^][a-zA-Z0-9/?_.=&{}":, _]/-/g')
+            relay_secret=$(awk '/^# @relay_secret/{print $3}' "$motion_conf")
         fi
     fi
 fi
 
-test -z "$port" && port="8765"
-test -z "$username" && username="admin"
+[ "$port" ] || port='8765'
 
-event="$2"
-motion_camera_id="$3"
-filename="$4"
+event=$2
+motion_camera_id=$3
+filename=$4
 
-uri="/_relay_event/?_username=$username&event=$event&motion_camera_id=$motion_camera_id"
+uri="/_relay_event/?event=$event&motion_camera_id=$motion_camera_id"
 data="{\"filename\": \"$filename\"}"
-signature=$(echo -n "POST:$uri:$data:$password" | sha1sum | cut -d ' ' -f 1)
 
-curl -s -S -m $timeout -H "Content-Type: application/json" -X POST "http://127.0.0.1:$port$uri&_signature=$signature" -d "$data" >/dev/null
-
+# Call relay endpoint with secret header for authentication
+curl -sSfm "$timeout" -H 'Content-Type: application/json' -H "X-Relay-Secret: $relay_secret" -X POST "http://127.0.0.1:$port$uri" -d "$data" -o /dev/null

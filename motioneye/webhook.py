@@ -1,4 +1,3 @@
-
 # Copyright (c) 2013 Calin Crisan
 # This file is part of motionEye.
 #
@@ -6,24 +5,31 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import json
 import logging
-import urllib2
-import urlparse
+import urllib.error
+import urllib.parse
+import urllib.request
 
-import settings
+from motioneye import settings
 
 
 def parse_options(parser, args):
+    parser.add_argument(
+        '--no-verify',
+        dest='verify',
+        action='store_false',
+        help="do not check the server's TLS certificate",
+    )
     parser.add_argument('method', help='the HTTP method to use')
     parser.add_argument('url', help='the URL for the request')
 
@@ -31,48 +37,51 @@ def parse_options(parser, args):
 
 
 def main(parser, args):
-    import meyectl
-    import utils
-    
+    from motioneye import meyectl, utils
+
     options = parse_options(parser, args)
-    
-    meyectl.configure_logging('webhook', options.log_to_file)
+
+    meyectl.configure_logging('webhook')
     meyectl.configure_tornado()
 
     logging.debug('hello!')
-    logging.debug('method = %s' % options.method)
-    logging.debug('url = %s' % options.url)
-    
-    headers = {}    
-    parts = urlparse.urlparse(options.url)
+    logging.debug(f'method = {options.method}')
+    logging.debug(f'url = {options.url}')
+    logging.debug(f'verify = {options.verify}')
+
+    # some endpoints reject requests without a User-Agent with HTTP 403
+    headers = {'User-Agent': 'motionEye'}
+    parts = urllib.parse.urlparse(options.url)
     url = options.url
     data = None
 
     if options.method == 'POST':
         headers['Content-Type'] = 'text/plain'
-        data = ''
+        data = b''
 
     elif options.method == 'POSTf':  # form url-encoded
         headers['Content-Type'] = 'application/x-www-form-urlencoded'
-        data = parts.query
+        data = parts.query.encode()
         url = options.url.split('?')[0]
 
     elif options.method == 'POSTj':  # json
         headers['Content-Type'] = 'application/json'
-        data = urlparse.parse_qs(parts.query)
-        data = {k: v[0] for (k, v) in data.iteritems()}
-        data = json.dumps(data)
+        data = urllib.parse.parse_qs(parts.query)
+        data = {k: v[0] for (k, v) in list(data.items())}
+        data = json.dumps(data).encode()
         url = options.url.split('?')[0]
 
     else:  # GET
         pass
 
-    request = urllib2.Request(url, data, headers=headers)
+    request = urllib.request.Request(url, data, headers=headers)
     try:
-        utils.urlopen(request, timeout=settings.REMOTE_REQUEST_TIMEOUT)
+        utils.urlopen(
+            request, timeout=settings.REMOTE_REQUEST_TIMEOUT, verify=options.verify
+        )
         logging.debug('webhook successfully called')
 
     except Exception as e:
-        logging.error('failed to call webhook: %s' % e)
+        logging.error(f'failed to call webhook: {e}')
 
     logging.debug('bye!')

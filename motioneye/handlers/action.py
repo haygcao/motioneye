@@ -1,0 +1,127 @@
+# Copyright (c) 2020 Vlsarro
+# Copyright (c) 2013 Calin Crisan
+# This file is part of motionEye.
+#
+# motionEye is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import logging
+import os
+import subprocess
+
+from tornado.ioloop import IOLoop
+from tornado.web import HTTPError
+
+from motioneye import config, motionctl, remote, utils
+from motioneye.handlers.base import BaseHandler
+
+__all__ = ('ActionHandler',)
+
+
+class ActionHandler(BaseHandler):
+    @BaseHandler.auth()
+    @BaseHandler.peer_allowed()
+    async def post(self, camera_id, action) -> None:
+        camera_id = int(camera_id)
+        if camera_id not in config.get_camera_ids():
+            raise HTTPError(404, 'no such camera')
+
+        local_config: dict = config.get_camera(camera_id)
+
+        # block access to admin-only cameras for non-admin users
+        if (
+            local_config
+            and local_config.get('@admin_only')
+            and self.current_user not in ['admin', 'peer']
+        ):
+            raise HTTPError(
+                403,
+                f'access denied to admin-only camera "{camera_id}" for action "{action}"',
+            )
+
+        if utils.is_remote_camera(local_config):
+            resp = await remote.exec_action(local_config, action)
+            if resp.error:
+                msg = (
+                    'Failed to execute action on remote camera at '
+                    f'{remote.pretty_camera_url(local_config)}: {resp.error}.'
+                )
+                self.finish_json({'error': msg})
+
+            else:
+                self.finish_json()
+
+        elif action in ('snapshot', 'eventstart', 'eventend'):
+            if action == 'snapshot' and not local_config.get('snapshot_filename'):
+                raise HTTPError(400, 'snapshots are disabled on this motionEye server')
+
+            logging.debug(f'received {action} action call for camera {camera_id}')
+            error = await motionctl.trigger_action(camera_id, action)
+            self.finish_json({'error': error})
+
+        elif action in ('detectionpause', 'detectionstart'):
+            state: str = action.removeprefix('detection')
+            logging.debug(
+                f'received call to {state!r} motion detection for camera {camera_id}'
+            )
+            error = await motionctl.set_motion_detection(camera_id, state)
+            self.finish_json({'error': error})
+
+        else:
+            action_commands = config.get_action_commands(local_config)
+            command = action_commands.get(action)
+            # motion_event and motion_detection are no commands, but the names of
+            # buttons the UI shows, which post eventstart/eventend resp.
+            # detectionstart/detectionpause depending on their state
+            if not command or action in ('motion_event', 'motion_detection'):
+                raise HTTPError(400, 'unknown action')
+
+            logging.debug(
+                f'executing {action} action for camera with id {camera_id}: "{command}"'
+            )
+            self.run_command_bg(command)
+
+    def run_command_bg(self, command):
+        self.p = subprocess.Popen(
+            command, stderr=subprocess.STDOUT, stdout=subprocess.PIPE
+        )
+        self.command = command
+
+        self.io_loop = IOLoop.current()
+        self.io_loop.call_later(0.1, self.check_command)
+
+    def check_command(self):
+        exit_status = self.p.poll()
+        if exit_status is not None:
+            output = self.p.stdout.read()
+            lines = output.decode('utf-8').split('\n')
+            if not lines[-1]:
+                lines = lines[:-1]
+            command = os.path.basename(self.command)
+            if exit_status:
+                logging.warning(
+                    f'{command}: command has finished with non-zero exit status: {exit_status}'
+                )
+                for line in lines:
+                    logging.warning(f'{command}: {line}')
+
+            else:
+                logging.debug(f'{command}: command has finished')
+                for line in lines:
+                    logging.debug(f'{command}: {line}')
+
+            return self.finish_json({'status': exit_status})
+
+        else:
+            self.io_loop.call_later(0.1, self.check_command)
+            return None
